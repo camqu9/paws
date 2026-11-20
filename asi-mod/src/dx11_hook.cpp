@@ -109,15 +109,16 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView) {
 
+#ifndef HAS_FFX_SDK
+    // Fast path: skip locking & depth capture completely during normal play
+    if (g_DebugMode == DebugViewMode::Normal) {
+        g_OrigOMSetRenderTargets(pContext, NumViews, ppRenderTargetViews, pDepthStencilView);
+        return;
+    }
+#endif
+
     if (!g_InInternalCall && pContext == g_Context) {
         std::lock_guard<std::mutex> lock(g_StateMutex);
-#ifndef HAS_FFX_SDK
-        // Only copy depth/scene buffers when a debug view needs them (avoids per-frame overhead)
-        if (g_DebugMode == DebugViewMode::Normal) {
-            g_OrigOMSetRenderTargets(pContext, NumViews, ppRenderTargetViews, pDepthStencilView);
-            return;
-        }
-#endif
         g_InInternalCall = true;
 
         // If we previously saw the main 3D scene pass and the game is now switching
