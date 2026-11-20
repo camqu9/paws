@@ -13,14 +13,19 @@ A from-scratch, zero-dependency upscaling suite built using only standard OS/gra
 When you run `paws.exe <path-to-exe-or-window-title>`:
 
 ```
-paws.exe <target>
+paws.exe [target | --watch-gtav]
+   │
+   ├── No args or --watch-gtav:
+   │     1. Watches live for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe)
+   │     2. Immediately copies paws_gtav.asi into the GTA V folder on launch
+   │     3. Automatically removes paws_gtav.asi as soon as GTA V closes
    │
    ├── Is target (or matched process) GTA5.exe? (case-insensitive)
    │      ├── YES (Windows):
    │      │     1. Auto-copies paws_gtav.asi into the GTA5.exe folder (if missing)
    │      │     2. Verifies ASI loader (dinput8.dll) and warns if missing
    │      │     3. Launches GTA5.exe directly (NO FSR 1.0 overlay on top)
-   │      │     4. Logs exit status when GTA5.exe closes
+   │      │     4. Automatically removes paws_gtav.asi & logs status when GTA5.exe closes
    │      │
    │      └── NO (all other programs / windows):
    │            1. Launches executable (if path) or attaches to existing window title

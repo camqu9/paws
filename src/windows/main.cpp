@@ -107,10 +107,10 @@ std::wstring GetProcessImagePath(DWORD pid) {
 bool IsGta5ExeName(const std::wstring& pathOrName) {
     fs::path p(pathOrName);
     std::wstring fname = ToLower(p.filename().wstring());
-    return fname == L"gta5.exe";
+    return fname == L"gta5.exe" || fname == L"playgtav.exe" || fname == L"gtavlauncher.exe";
 }
 
-// Find a running GTA5.exe process if present
+// Find any running GTA V process (PlayGTAV.exe, GTAVLauncher.exe, or GTA5.exe)
 bool FindRunningGta5(DWORD& outPid, fs::path& outExePath) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return false;
@@ -119,17 +119,94 @@ bool FindRunningGta5(DWORD& outPid, fs::path& outExePath) {
     bool found = false;
     if (Process32FirstW(snap, &pe)) {
         do {
-            if (ToLower(pe.szExeFile) == L"gta5.exe") {
+            std::wstring exe = ToLower(pe.szExeFile);
+            if (exe == L"gta5.exe" || exe == L"playgtav.exe" || exe == L"gtavlauncher.exe") {
                 outPid = pe.th32ProcessID;
                 std::wstring full = GetProcessImagePath(outPid);
                 if (!full.empty()) outExePath = fs::path(full);
                 found = true;
-                break;
+                if (exe == L"gta5.exe") break; // Prefer main GTA5.exe if both exist
             }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
     return found;
+}
+
+bool IsAnyGtaVRunning() {
+    DWORD pid = 0;
+    fs::path p;
+    return FindRunningGta5(pid, p);
+}
+
+bool DeployAsiToGtaDir(const fs::path& gameDir, fs::path& outDstAsi) {
+    fs::path selfDir = GetSelfDirectory();
+    fs::path srcAsi = selfDir / L"paws_gtav.asi";
+    outDstAsi = gameDir / L"paws_gtav.asi";
+
+    if (fs::exists(outDstAsi)) {
+        std::cout << "[paws] paws_gtav.asi is already present in: " << WideToUtf8(gameDir.wstring()) << "\n";
+        return true;
+    }
+    if (!fs::exists(srcAsi)) {
+        std::cerr << "[paws] WARNING: Could not find paws_gtav.asi next to paws.exe ("
+                  << WideToUtf8(srcAsi.wstring()) << ").\n"
+                  << "       Build both targets with CMake so paws_gtav.asi sits beside paws.exe.\n";
+        return false;
+    }
+
+    std::error_code ec;
+    if (fs::copy_file(srcAsi, outDstAsi, fs::copy_options::overwrite_existing, ec)) {
+        std::cout << "[paws] Live-deployed paws_gtav.asi -> " << WideToUtf8(outDstAsi.wstring()) << "\n";
+        return true;
+    }
+    std::cerr << "[paws] ERROR: Failed to copy paws_gtav.asi (" << ec.message() << "). "
+              << "Try running as Administrator if the game is in Program Files.\n";
+    return false;
+}
+
+void RemoveAsiFromGtaDir(const fs::path& dstAsi) {
+    if (dstAsi.empty() || !fs::exists(dstAsi)) return;
+    // Retry briefly in case Windows takes a moment to release the DLL handle after process exit
+    for (int attempt = 0; attempt < 20; ++attempt) {
+        std::error_code ec;
+        if (fs::remove(dstAsi, ec) && !ec) {
+            std::cout << "[paws] Removed paws_gtav.asi from GTA V folder: " << WideToUtf8(dstAsi.wstring()) << "\n";
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+    std::cerr << "[paws] WARNING: Could not remove " << WideToUtf8(dstAsi.wstring())
+              << " (file may still be locked).\n";
+}
+
+void CheckAsiLoader(const fs::path& gameDir) {
+    fs::path dinputPath = gameDir / L"dinput8.dll";
+    if (!fs::exists(dinputPath)) {
+        std::cout << "\n======================================================================\n"
+                  << "[paws] WARNING: ASI loader (dinput8.dll) NOT found in GTA V directory!\n"
+                  << "       GTA5.exe will NOT load paws_gtav.asi without an ASI loader.\n"
+                  << "       Please install Ultimate ASI Loader or Script Hook V (dinput8.dll)\n"
+                  << "       into: " << WideToUtf8(gameDir.wstring()) << "\n"
+                  << "       REMINDER: Use .asi plugins in GTA V Story Mode ONLY (never GTA Online).\n"
+                  << "======================================================================\n\n";
+    } else {
+        std::cout << "[paws] Verified ASI loader (dinput8.dll) in game directory.\n";
+    }
+}
+
+volatile bool g_WatcherStop = false;
+fs::path g_ActiveDeployedAsi;
+
+BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
+    if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_BREAK_EVENT) {
+        g_WatcherStop = true;
+        if (!g_ActiveDeployedAsi.empty() && !IsAnyGtaVRunning()) {
+            RemoveAsiFromGtaDir(g_ActiveDeployedAsi);
+        }
+        return TRUE;
+    }
+    return FALSE;
 }
 
 struct WindowSearchCtx {
@@ -185,53 +262,34 @@ HWND FindWindowByTitle(const std::wstring& query) {
 }
 
 // ============================================================================
-// Smart Launcher: GTA V Legacy Auto-Deployment & Direct Launch
+// Smart Launcher: GTA V Legacy Auto-Deployment, Direct Launch & Auto-Cleanup
 // ============================================================================
 int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD runningPid) {
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+
     std::cout << "[paws] GTA V Legacy detected (" << WideToUtf8(gtaExePath.wstring()) << ")\n";
     std::cout << "[paws] Routing to internal DX11 FSR 2/3 ASI plugin (paws_gtav.asi) instead of FSR 1.0 overlay.\n";
 
     fs::path gameDir = gtaExePath.parent_path();
-    fs::path selfDir = GetSelfDirectory();
-    fs::path srcAsi = selfDir / L"paws_gtav.asi";
-    fs::path dstAsi = gameDir / L"paws_gtav.asi";
+    fs::path dstAsi;
+    DeployAsiToGtaDir(gameDir, dstAsi);
+    g_ActiveDeployedAsi = dstAsi;
 
-    // 1. Auto-deploy paws_gtav.asi into GTA5.exe directory if not already present
-    if (fs::exists(dstAsi)) {
-        std::cout << "[paws] paws_gtav.asi is already present in: " << WideToUtf8(gameDir.wstring()) << "\n";
-    } else if (fs::exists(srcAsi)) {
-        std::error_code ec;
-        if (fs::copy_file(srcAsi, dstAsi, fs::copy_options::overwrite_existing, ec)) {
-            std::cout << "[paws] Deployed paws_gtav.asi -> " << WideToUtf8(dstAsi.wstring()) << "\n";
-        } else {
-            std::cerr << "[paws] ERROR: Failed to copy paws_gtav.asi (" << ec.message() << "). "
-                      << "Try running as Administrator if the game is in Program Files.\n";
-        }
-    } else {
-        std::cerr << "[paws] WARNING: Could not find paws_gtav.asi next to paws.exe ("
-                  << WideToUtf8(srcAsi.wstring()) << ").\n"
-                  << "       Build both targets with CMake so paws_gtav.asi sits beside paws.exe.\n";
-    }
+    CheckAsiLoader(gameDir);
 
-    // 2. Check for ASI loader (dinput8.dll)
-    fs::path dinputPath = gameDir / L"dinput8.dll";
-    if (!fs::exists(dinputPath)) {
-        std::cout << "\n======================================================================\n"
-                  << "[paws] WARNING: ASI loader (dinput8.dll) NOT found in GTA V directory!\n"
-                  << "       GTA5.exe will NOT load paws_gtav.asi without an ASI loader.\n"
-                  << "       Please install Ultimate ASI Loader or Script Hook V (dinput8.dll)\n"
-                  << "       into: " << WideToUtf8(gameDir.wstring()) << "\n"
-                  << "       REMINDER: Use .asi plugins in GTA V Story Mode ONLY (never GTA Online).\n"
-                  << "======================================================================\n\n";
-    } else {
-        std::cout << "[paws] Verified ASI loader (dinput8.dll) in game directory.\n";
-    }
-
-    // 3. Launch GTA5.exe directly (do not spawn FSR 1.0 overlay)
+    // If GTA V is already running, monitor it and remove paws_gtav.asi when it closes
     if (alreadyRunning) {
-        std::cout << "[paws] GTA5.exe is already running (PID " << runningPid << ").\n"
-                  << "[paws] If paws_gtav.asi was just copied, restart GTA V for it to load.\n"
+        std::cout << "[paws] GTA V is already running (PID " << runningPid << ").\n"
+                  << "[paws] Monitoring GTA V — paws_gtav.asi will be removed automatically when GTA V closes.\n"
                   << "[paws] In-game hotkeys: F8 = Cycle Normal/Depth/MotionVectors, F9 = Toggle FSR.\n";
+        while (!g_WatcherStop && IsAnyGtaVRunning()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        }
+        if (!IsAnyGtaVRunning()) {
+            std::cout << "[paws] GTA V closed.\n";
+            RemoveAsiFromGtaDir(dstAsi);
+            g_ActiveDeployedAsi.clear();
+        }
         return 0;
     }
 
@@ -248,6 +306,8 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
     if (!CreateProcessW(gtaExePath.c_str(), cmdLine.data(), nullptr, nullptr, FALSE,
                         0, nullptr, workDir.c_str(), &si, &pi)) {
         std::cerr << "[paws] ERROR: CreateProcessW failed for GTA5.exe (error " << GetLastError() << ").\n";
+        RemoveAsiFromGtaDir(dstAsi);
+        g_ActiveDeployedAsi.clear();
         return 1;
     }
 
@@ -260,11 +320,76 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
 
+    // Wait for any remaining GTA V processes (e.g., launcher child) to finish
+    while (IsAnyGtaVRunning()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::steady_clock::now() - startTime).count();
     std::cout << "[paws] GTA5.exe exited with code " << exitCode
               << " after " << elapsed << "s.\n";
+
+    RemoveAsiFromGtaDir(dstAsi);
+    g_ActiveDeployedAsi.clear();
     return static_cast<int>(exitCode);
+}
+
+// ============================================================================
+// Live GTA V Auto-Watcher:
+// Watches for GTA V launching (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe),
+// immediately deploys paws_gtav.asi into the GTA V folder, and automatically
+// removes paws_gtav.asi as soon as GTA V closes.
+// ============================================================================
+int RunGtaVLiveWatcher() {
+    SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+
+    std::cout << "[paws] Live GTA V watcher active.\n"
+              << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
+              << "[paws] Press Ctrl+C or END to stop watching.\n";
+
+    bool active = false;
+    fs::path deployedAsi;
+
+    while (!g_WatcherStop) {
+        if ((GetAsyncKeyState(VK_END) & 0x8000) != 0) {
+            std::cout << "[paws] END pressed. Stopping watcher.\n";
+            break;
+        }
+
+        DWORD pid = 0;
+        fs::path exePath;
+        bool running = FindRunningGta5(pid, exePath);
+
+        if (running && !active) {
+            if (!exePath.empty()) {
+                fs::path gameDir = exePath.parent_path();
+                std::cout << "\n[paws] Detected GTA V starting (PID " << pid << "): "
+                          << WideToUtf8(exePath.wstring()) << "\n";
+                if (DeployAsiToGtaDir(gameDir, deployedAsi)) {
+                    g_ActiveDeployedAsi = deployedAsi;
+                }
+                CheckAsiLoader(gameDir);
+                std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi when GTA V closes.\n";
+                active = true;
+            }
+        } else if (!running && active) {
+            std::cout << "\n[paws] Detected GTA V closed.\n";
+            RemoveAsiFromGtaDir(deployedAsi);
+            deployedAsi.clear();
+            g_ActiveDeployedAsi.clear();
+            active = false;
+            std::cout << "[paws] Resuming watch for GTA V...\n";
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (active && !deployedAsi.empty() && !IsAnyGtaVRunning()) {
+        RemoveAsiFromGtaDir(deployedAsi);
+        g_ActiveDeployedAsi.clear();
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -833,9 +958,12 @@ int RunFsr1Overlay(HWND targetHwnd, float sharpness) {
 void PrintUsage() {
     std::cout << "paws - Universal FSR 1.0 Upscaler & GTA V Legacy FSR 2/3 Smart Launcher\n"
               << "Usage:\n"
+              << "  paws.exe                               (live-watch for GTA V, auto-add & auto-remove paws_gtav.asi)\n"
+              << "  paws.exe --watch-gtav                  (same: live GTA V watcher)\n"
               << "  paws.exe <path-to-exe-or-window-title> [--sharpness <0.0-2.0>]\n\n"
               << "Examples:\n"
-              << "  paws.exe \"C:\\Games\\GTAV\\GTA5.exe\"   (auto-deploys paws_gtav.asi & launches directly)\n"
+              << "  paws.exe --watch-gtav                  (watches live: adds paws_gtav.asi on launch, removes on exit)\n"
+              << "  paws.exe \"C:\\Games\\GTAV\\GTA5.exe\"   (deploys paws_gtav.asi, launches GTA V, removes on exit)\n"
               << "  paws.exe \"Some Window Title\"          (attaches universal FSR 1.0 overlay)\n"
               << "  paws.exe \"C:\\Apps\\Game.exe\"          (launches & upscales with FSR 1.0)\n";
 }
@@ -844,23 +972,29 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        PrintUsage();
-        return 1;
+        return RunGtaVLiveWatcher();
     }
 
     std::string targetArg;
     float sharpness = 0.2f;
+    bool watchGtaV = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
             PrintUsage();
             return 0;
+        } else if (a == "--watch-gtav" || a == "--watch") {
+            watchGtaV = true;
         } else if (a == "--sharpness" && i + 1 < argc) {
             sharpness = std::stof(argv[++i]);
         } else if (targetArg.empty()) {
             targetArg = a;
         }
+    }
+
+    if (watchGtaV) {
+        return RunGtaVLiveWatcher();
     }
 
     if (targetArg.empty()) {

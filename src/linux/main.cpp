@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -408,11 +409,193 @@ bool IsKeyPressed(Display* dpy, KeySym sym) {
     return (keys[kc >> 3] & (1 << (kc & 7))) != 0;
 }
 
+// ============================================================================
+// Live GTA V Auto-Watcher (Linux / Proton / Wine)
+// Scans /proc for PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe, automatically
+// copies paws_gtav.asi into the GTA V folder when detected, and removes it
+// automatically as soon as GTA V exits.
+// ============================================================================
+fs::path GetSelfDirectoryLinux() {
+    std::error_code ec;
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec && !exe.empty()) return exe.parent_path();
+    return fs::current_path();
+}
+
+fs::path ResolveAsiSourceLinux(const std::string& customAsiPath) {
+    if (!customAsiPath.empty() && fs::exists(customAsiPath)) {
+        return fs::path(customAsiPath);
+    }
+    fs::path beside = GetSelfDirectoryLinux() / "paws_gtav.asi";
+    if (fs::exists(beside)) return beside;
+    fs::path cwdAsi = fs::current_path() / "paws_gtav.asi";
+    if (fs::exists(cwdAsi)) return cwdAsi;
+    return beside;
+}
+
+bool ExtractGtaDirFromArg(const std::string& arg, fs::path& outDir) {
+    std::string lower = ToLower(arg);
+    if (lower.find("gta5.exe") == std::string::npos &&
+        lower.find("playgtav.exe") == std::string::npos &&
+        lower.find("gtavlauncher.exe") == std::string::npos) {
+        return false;
+    }
+
+    std::string pathStr = arg;
+    // Convert Wine Z:\path\to\GTA5.exe -> /path/to/GTA5.exe
+    if (pathStr.size() >= 3 && (pathStr[0] == 'Z' || pathStr[0] == 'z') && pathStr[1] == ':') {
+        pathStr = pathStr.substr(2);
+        std::replace(pathStr.begin(), pathStr.end(), '\\', '/');
+    }
+
+    if (!pathStr.empty() && pathStr[0] == '/') {
+        fs::path p(pathStr);
+        std::error_code ec;
+        if (fs::exists(p.parent_path(), ec)) {
+            outDir = p.parent_path();
+            return true;
+        }
+    }
+    return false;
+}
+
+bool FindRunningGtaVLinux(pid_t& outPid, fs::path& outGameDir) {
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator("/proc", ec)) {
+        if (!entry.is_directory()) continue;
+        std::string name = entry.path().filename().string();
+        if (name.empty() || !std::all_of(name.begin(), name.end(), ::isdigit)) continue;
+
+        std::ifstream f(entry.path() / "cmdline", std::ios::binary);
+        if (!f) continue;
+        std::string raw((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (raw.empty()) continue;
+
+        // Parse NUL-separated arguments
+        size_t pos = 0;
+        bool matchedGta = false;
+        while (pos < raw.size()) {
+            size_t end = raw.find('\0', pos);
+            if (end == std::string::npos) end = raw.size();
+            std::string arg = raw.substr(pos, end - pos);
+            pos = end + 1;
+            if (arg.empty()) continue;
+
+            std::string lower = ToLower(arg);
+            if (lower.find("gta5.exe") != std::string::npos ||
+                lower.find("playgtav.exe") != std::string::npos ||
+                lower.find("gtavlauncher.exe") != std::string::npos) {
+                matchedGta = true;
+                fs::path dir;
+                if (ExtractGtaDirFromArg(arg, dir)) {
+                    outPid = static_cast<pid_t>(std::stol(name));
+                    outGameDir = dir;
+                    return true;
+                }
+            }
+        }
+
+        if (matchedGta) {
+            fs::path cwd = fs::read_symlink(entry.path() / "cwd", ec);
+            if (!ec && fs::exists(cwd, ec)) {
+                outPid = static_cast<pid_t>(std::stol(name));
+                outGameDir = cwd;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+void RemoveAsiLinux(const fs::path& dstAsi) {
+    if (dstAsi.empty()) return;
+    std::error_code ec;
+    if (fs::exists(dstAsi, ec)) {
+        if (fs::remove(dstAsi, ec) && !ec) {
+            std::cout << "[paws] Removed paws_gtav.asi from GTA V folder: " << dstAsi.string() << "\n";
+        } else {
+            std::cerr << "[paws] WARNING: Failed to remove " << dstAsi.string() << " (" << ec.message() << ")\n";
+        }
+    }
+}
+
+int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
+    std::signal(SIGINT, HandleSignal);
+    std::signal(SIGTERM, HandleSignal);
+
+    fs::path srcAsi = ResolveAsiSourceLinux(customAsiPath);
+    std::cout << "[paws] Live GTA V watcher active (Linux / Proton / Wine).\n"
+              << "[paws] Source ASI: " << srcAsi.string()
+              << (fs::exists(srcAsi) ? " (found)\n" : " (NOT found yet — place Windows-built paws_gtav.asi here or pass --asi <path>)\n")
+              << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
+              << "[paws] Press Ctrl+C to stop watching.\n";
+
+    bool active = false;
+    fs::path deployedAsi;
+
+    while (!g_ShouldQuit) {
+        pid_t pid = 0;
+        fs::path gameDir;
+        bool running = FindRunningGtaVLinux(pid, gameDir);
+
+        if (running && !active) {
+            std::cout << "\n[paws] Detected GTA V starting (PID " << pid << ") in: " << gameDir.string() << "\n";
+            fs::path dstAsi = gameDir / "paws_gtav.asi";
+            fs::path src = ResolveAsiSourceLinux(customAsiPath);
+
+            if (fs::exists(dstAsi)) {
+                std::cout << "[paws] paws_gtav.asi is already present in GTA V folder.\n";
+                deployedAsi = dstAsi;
+            } else if (fs::exists(src)) {
+                std::error_code ec;
+                if (fs::copy_file(src, dstAsi, fs::copy_options::overwrite_existing, ec)) {
+                    std::cout << "[paws] Live-deployed paws_gtav.asi -> " << dstAsi.string() << "\n";
+                    deployedAsi = dstAsi;
+                } else {
+                    std::cerr << "[paws] ERROR: Failed to copy paws_gtav.asi (" << ec.message() << ").\n";
+                }
+            } else {
+                std::cerr << "[paws] WARNING: paws_gtav.asi not found at " << src.string() << ".\n";
+            }
+
+            if (!fs::exists(gameDir / "dinput8.dll")) {
+                std::cout << "[paws] WARNING: dinput8.dll not found in " << gameDir.string() << ".\n"
+                          << "       Install an ASI loader (dinput8.dll) and set Steam Launch Options to:\n"
+                          << "         WINEDLLOVERRIDES=\"dinput8=n,b\" %command%\n";
+            } else {
+                std::cout << "[paws] Verified dinput8.dll in GTA V folder.\n";
+            }
+            std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi when GTA V closes.\n";
+            active = true;
+        } else if (!running && active) {
+            std::cout << "\n[paws] Detected GTA V closed.\n";
+            RemoveAsiLinux(deployedAsi);
+            deployedAsi.clear();
+            active = false;
+            std::cout << "[paws] Resuming watch for GTA V...\n";
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    if (active && !deployedAsi.empty()) {
+        pid_t pid = 0;
+        fs::path dir;
+        if (!FindRunningGtaVLinux(pid, dir)) {
+            RemoveAsiLinux(deployedAsi);
+        }
+    }
+    std::cout << "\n[paws] Watcher stopped.\n";
+    return 0;
+}
+
 void PrintUsage() {
-    std::cout << "paws - Universal FSR 1.0 Spatial Upscaler (Linux / X11 + OpenGL)\n"
+    std::cout << "paws - Universal FSR 1.0 Spatial Upscaler & Live GTA V ASI Watcher (Linux)\n"
               << "Usage:\n"
+              << "  paws                                          (live-watch for GTA V, auto-add & auto-remove paws_gtav.asi)\n"
+              << "  paws --watch-gtav [--asi <path/paws_gtav.asi>]\n"
               << "  paws <path-to-executable-or-window-title> [--sharpness <0.0-2.0>]\n\n"
-              << "Hotkeys:\n"
+              << "Hotkeys (FSR 1.0 Overlay):\n"
               << "  F8   Toggle RCAS sharpening on/off\n"
               << "  End  Quit overlay\n";
 }
@@ -421,17 +604,23 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        PrintUsage();
-        return 1;
+        return RunGtaVLiveWatcherLinux("");
     }
 
     std::string targetArg;
+    std::string customAsiPath;
     float sharpness = 0.2f;
+    bool watchGtaV = false;
+
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") {
             PrintUsage();
             return 0;
+        } else if (a == "--watch-gtav" || a == "--watch") {
+            watchGtaV = true;
+        } else if (a == "--asi" && i + 1 < argc) {
+            customAsiPath = argv[++i];
         } else if (a == "--sharpness" && i + 1 < argc) {
             sharpness = std::stof(argv[++i]);
         } else if (targetArg.empty()) {
@@ -439,18 +628,13 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (watchGtaV || ToLower(fs::path(targetArg).filename().string()) == "gta5.exe") {
+        return RunGtaVLiveWatcherLinux(customAsiPath);
+    }
+
     if (targetArg.empty()) {
         PrintUsage();
         return 1;
-    }
-
-    // Inform user if GTA5.exe is passed on Linux (e.g. Wine/Proton)
-    if (ToLower(fs::path(targetArg).filename().string()) == "gta5.exe") {
-        std::cout << "[paws] Note: GTA5.exe detected on Linux.\n"
-                  << "       For GTA V Legacy under Proton/Wine, copy Windows-built paws_gtav.asi\n"
-                  << "       and dinput8.dll into the GTA V folder and launch with:\n"
-                  << "         WINEDLLOVERRIDES=\"dinput8=n,b\" %command%\n"
-                  << "       Proceeding to search for a running window to attach FSR 1.0 overlay...\n";
     }
 
     std::signal(SIGINT, HandleSignal);
