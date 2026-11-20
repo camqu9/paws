@@ -1,5 +1,6 @@
 #include "fsr_pipeline.h"
 #include "motion_vectors_shader.h"
+#include "temporal_upscale_shader.h"
 
 #include <d3dcompiler.h>
 #include <cstring>
@@ -63,6 +64,16 @@ struct alignas(16) DebugCBData {
     float pad[3];
 };
 
+struct alignas(16) TemporalCBData {
+    float renderSize[2];
+    float invRenderSize[2];
+    float displaySize[2];
+    float invDisplaySize[2];
+    float sharpness;
+    int resetHistory;
+    float pad[2];
+};
+
 bool CompileHlsl(const char* src, const char* entry, const char* target, ID3DBlob** outBlob) {
     ID3DBlob* err = nullptr;
     HRESULT hr = D3DCompile(src, std::strlen(src), nullptr, nullptr, nullptr,
@@ -120,27 +131,32 @@ bool FsrPipeline::Init(ID3D11Device* device, ID3D11DeviceContext* /*context*/) {
     device_ = device;
 
     ID3DBlob* csBlob = nullptr;
+    ID3DBlob* tuBlob = nullptr;
     ID3DBlob* vsBlob = nullptr;
     ID3DBlob* psBlob = nullptr;
 
     if (!CompileHlsl(kMotionVectorsHlsl, "main", "cs_5_0", &csBlob) ||
+        !CompileHlsl(kTemporalUpscaleHlsl, "main", "cs_5_0", &tuBlob) ||
         !CompileHlsl(kDebugVS, "main", "vs_5_0", &vsBlob) ||
         !CompileHlsl(kDebugPS, "main", "ps_5_0", &psBlob)) {
         SafeRelease(csBlob);
+        SafeRelease(tuBlob);
         SafeRelease(vsBlob);
         SafeRelease(psBlob);
         return false;
     }
 
     HRESULT hr1 = device_->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), nullptr, &motionVecCS_);
+    HRESULT hrT = device_->CreateComputeShader(tuBlob->GetBufferPointer(), tuBlob->GetBufferSize(), nullptr, &temporalUpscaleCS_);
     HRESULT hr2 = device_->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &debugVS_);
     HRESULT hr3 = device_->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &debugPS_);
     SafeRelease(csBlob);
+    SafeRelease(tuBlob);
     SafeRelease(vsBlob);
     SafeRelease(psBlob);
 
-    if (FAILED(hr1) || FAILED(hr2) || FAILED(hr3)) {
-        PAWS_LOG("Failed to create DX11 shaders (CS=0x%08X VS=0x%08X PS=0x%08X)", hr1, hr2, hr3);
+    if (FAILED(hr1) || FAILED(hrT) || FAILED(hr2) || FAILED(hr3)) {
+        PAWS_LOG("Failed to create DX11 shaders (CS=0x%08X TU=0x%08X VS=0x%08X PS=0x%08X)", hr1, hrT, hr2, hr3);
         Shutdown();
         return false;
     }
@@ -150,6 +166,9 @@ bool FsrPipeline::Init(ID3D11Device* device, ID3D11DeviceContext* /*context*/) {
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.ByteWidth = sizeof(MotionVectorCameraCB);
     device_->CreateBuffer(&cbDesc, nullptr, &cameraCB_);
+
+    cbDesc.ByteWidth = sizeof(TemporalCBData);
+    device_->CreateBuffer(&cbDesc, nullptr, &temporalCB_);
 
     cbDesc.ByteWidth = sizeof(DebugCBData);
     device_->CreateBuffer(&cbDesc, nullptr, &debugCB_);
@@ -168,6 +187,8 @@ void FsrPipeline::Shutdown() {
     ReleaseRenderResources();
     SafeRelease(motionVecCS_);
     SafeRelease(cameraCB_);
+    SafeRelease(temporalUpscaleCS_);
+    SafeRelease(temporalCB_);
     SafeRelease(debugVS_);
     SafeRelease(debugPS_);
     SafeRelease(debugCB_);
@@ -194,6 +215,13 @@ void FsrPipeline::ReleaseRenderResources() {
     SafeRelease(motionVecTex_);
     SafeRelease(fsrOutputUAV_);
     SafeRelease(fsrOutputTex_);
+    for (int i = 0; i < 2; ++i) {
+        SafeRelease(historySRV_[i]);
+        SafeRelease(historyUAV_[i]);
+        SafeRelease(historyTex_[i]);
+    }
+    historyIndex_ = 0;
+    historyValid_ = false;
     renderWidth_ = 0;
     renderHeight_ = 0;
     colorFormat_ = DXGI_FORMAT_UNKNOWN;
@@ -255,13 +283,21 @@ bool FsrPipeline::EnsureRenderResources(uint32_t width, uint32_t height, DXGI_FO
     device_->CreateUnorderedAccessView(motionVecTex_, nullptr, &motionVecUAV_);
     device_->CreateShaderResourceView(motionVecTex_, nullptr, &motionVecSRV_);
 
-    // FSR output texture
+    // FSR output texture + ping-pong temporal history textures
     D3D11_TEXTURE2D_DESC otd = ctd;
     otd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     otd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     if (SUCCEEDED(device_->CreateTexture2D(&otd, nullptr, &fsrOutputTex_))) {
         device_->CreateUnorderedAccessView(fsrOutputTex_, nullptr, &fsrOutputUAV_);
     }
+    for (int i = 0; i < 2; ++i) {
+        if (SUCCEEDED(device_->CreateTexture2D(&otd, nullptr, &historyTex_[i]))) {
+            device_->CreateShaderResourceView(historyTex_[i], nullptr, &historySRV_[i]);
+            device_->CreateUnorderedAccessView(historyTex_[i], nullptr, &historyUAV_[i]);
+        }
+    }
+    historyIndex_ = 0;
+    historyValid_ = false;
 
     renderWidth_ = width;
     renderHeight_ = height;
@@ -404,9 +440,51 @@ void FsrPipeline::Execute(ID3D11DeviceContext* context,
         }
 #else
         if (!loggedSdkStatus_) {
-            PAWS_LOG("Compiled without HAS_FFX_SDK: Motion Vector CS & debug views active; "
-                     "rebuild with -DPAWS_FFX_SDK_DIR=<path-to-FidelityFX-SDK> to enable FSR 2/3 dispatch.");
+            PAWS_LOG("Native DX11 Temporal Upscaling + RCAS active (using depth-derived R16G16_FLOAT motion vectors).");
             loggedSdkStatus_ = true;
+        }
+
+        uint32_t readIdx = historyIndex_;
+        uint32_t writeIdx = 1u - historyIndex_;
+        if (temporalUpscaleCS_ && historySRV_[readIdx] && historyUAV_[writeIdx]) {
+            TemporalCBData tcb{};
+            tcb.renderSize[0] = static_cast<float>(renderWidth_);
+            tcb.renderSize[1] = static_cast<float>(renderHeight_);
+            tcb.invRenderSize[0] = 1.0f / tcb.renderSize[0];
+            tcb.invRenderSize[1] = 1.0f / tcb.renderSize[1];
+            tcb.displaySize[0] = static_cast<float>(renderWidth_);
+            tcb.displaySize[1] = static_cast<float>(renderHeight_);
+            tcb.invDisplaySize[0] = tcb.invRenderSize[0];
+            tcb.invDisplaySize[1] = tcb.invRenderSize[1];
+            tcb.sharpness = 0.25f;
+            tcb.resetHistory = historyValid_ ? 0 : 1;
+            context->UpdateSubresource(temporalCB_, 0, nullptr, &tcb, 0, 0);
+
+            ID3D11ShaderResourceView* tuSrvs[3] = { colorCopySRV_, motionVecSRV_, historySRV_[readIdx] };
+            ID3D11UnorderedAccessView* tuUavs[1] = { historyUAV_[writeIdx] };
+            ID3D11Buffer* tuCbs[1] = { temporalCB_ };
+
+            context->CSSetShader(temporalUpscaleCS_, nullptr, 0);
+            context->CSSetConstantBuffers(0, 1, tuCbs);
+            context->CSSetShaderResources(0, 3, tuSrvs);
+            context->CSSetSamplers(0, 1, &linearSampler_);
+            context->CSSetUnorderedAccessViews(0, 1, tuUavs, nullptr);
+            context->Dispatch(groupsX, groupsY, 1);
+
+            ID3D11ShaderResourceView* nullSrvs3[3] = { nullptr, nullptr, nullptr };
+            context->CSSetShaderResources(0, 3, nullSrvs3);
+            context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+            context->CSSetShader(nullptr, nullptr, 0);
+
+            historyIndex_ = writeIdx;
+            historyValid_ = true;
+
+            D3D11_TEXTURE2D_DESC bbDesc{};
+            backbufferTex->GetDesc(&bbDesc);
+            if (bbDesc.Width == renderWidth_ && bbDesc.Height == renderHeight_ &&
+                bbDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                context->CopyResource(backbufferTex, historyTex_[writeIdx]);
+            }
         }
 #endif
     }

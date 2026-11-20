@@ -59,12 +59,15 @@ private:
     ID3D11ComputeShader* motionVecCS_ = nullptr;
     ID3D11Buffer* cameraCB_ = nullptr;
 
+    ID3D11ComputeShader* temporalUpscaleCS_ = nullptr;
+    ID3D11Buffer* temporalCB_ = nullptr;
+
     ID3D11VertexShader* debugVS_ = nullptr;
     ID3D11PixelShader* debugPS_ = nullptr;
     ID3D11Buffer* debugCB_ = nullptr;
     ID3D11SamplerState* linearSampler_ = nullptr;
 
-    // Captured scene buffers + motion vectors + FSR output
+    // Captured scene buffers + motion vectors + ping-pong temporal history
     ID3D11Texture2D* colorCopyTex_ = nullptr;
     ID3D11ShaderResourceView* colorCopySRV_ = nullptr;
 
@@ -77,6 +80,12 @@ private:
 
     ID3D11Texture2D* fsrOutputTex_ = nullptr;
     ID3D11UnorderedAccessView* fsrOutputUAV_ = nullptr;
+
+    ID3D11Texture2D* historyTex_[2] = { nullptr, nullptr };
+    ID3D11ShaderResourceView* historySRV_[2] = { nullptr, nullptr };
+    ID3D11UnorderedAccessView* historyUAV_[2] = { nullptr, nullptr };
+    uint32_t historyIndex_ = 0;
+    bool historyValid_ = false;
 
 #ifdef HAS_FFX_SDK
     bool ffxContextCreated_ = false;
