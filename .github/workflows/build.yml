@@ -1,0 +1,64 @@
+name: Build paws
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    name: Windows (x64 MSVC)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (x64)
+        run: cmake -B build -A x64
+
+      - name: Build paws.exe and paws_gtav.asi (Release)
+        run: cmake --build build --config Release
+
+      - name: Verify output binaries
+        shell: pwsh
+        run: |
+          if (!(Test-Path "build/bin/Release/paws.exe")) { throw "paws.exe not found!" }
+          if (!(Test-Path "build/bin/Release/paws_gtav.asi")) { throw "paws_gtav.asi not found!" }
+          Get-ChildItem "build/bin/Release"
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: paws-windows-x64
+          path: |
+            build/bin/Release/paws.exe
+            build/bin/Release/paws_gtav.asi
+
+  build-linux:
+    name: Linux (x64 GCC)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install X11 & OpenGL development packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake libx11-dev libxcomposite-dev libxfixes-dev libgl-dev
+
+      - name: Configure CMake (Release)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build paws
+        run: cmake --build build --parallel
+
+      - name: Verify output binary
+        run: ls -lh build/bin/paws
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: paws-linux-x64
+          path: build/bin/paws
