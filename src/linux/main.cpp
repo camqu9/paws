@@ -729,13 +729,13 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        return RunGtaVLiveWatcherLinux("", 2);
+        return RunGtaVLiveWatcherLinux("", 3);
     }
 
     std::string targetArg;
     std::string customAsiPath;
     float sharpness = 0.2f;
-    int samplingMode = 2; // Default: 2/3 (67% FSR Quality)
+    int samplingMode = 3; // Default: 2/3 (67% Quality)
     bool watchGtaV = false;
 
     for (int i = 1; i < argc; ++i) {

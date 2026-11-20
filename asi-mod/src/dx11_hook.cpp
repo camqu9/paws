@@ -111,6 +111,13 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
 
     if (!g_InInternalCall && pContext == g_Context) {
         std::lock_guard<std::mutex> lock(g_StateMutex);
+#ifndef HAS_FFX_SDK
+        // Only copy depth/scene buffers when a debug view needs them (avoids per-frame overhead)
+        if (g_DebugMode == DebugViewMode::Normal) {
+            g_OrigOMSetRenderTargets(pContext, NumViews, ppRenderTargetViews, pDepthStencilView);
+            return;
+        }
+#endif
         g_InInternalCall = true;
 
         // If we previously saw the main 3D scene pass and the game is now switching
@@ -139,7 +146,7 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
                     colorTex->GetDesc(&cDesc);
                     depthTex->GetDesc(&dDesc);
 
-                    if (cDesc.Width >= 640 && cDesc.Height >= 360 &&
+                    if (cDesc.Width >= 1280 && cDesc.Height >= 720 &&
                         cDesc.Width == dDesc.Width && cDesc.Height == dDesc.Height &&
                         IsTargetDepthFormat(dDesc.Format)) {
                         if (cDesc.Width != g_LastLoggedW || cDesc.Height != g_LastLoggedH) {

@@ -420,120 +420,124 @@ void FsrPipeline::Execute(ID3D11DeviceContext* context,
                           const CameraTracker& camera,
                           bool fsrEnabled,
                           DebugViewMode debugMode) {
-    if (!initialized_ || !context || !backbufferTex || !capturedThisFrame_ || !depthCopySRV_ || !motionVecUAV_) {
+    if (!initialized_ || !context || !backbufferTex) {
         return;
     }
 
-    // 1. Dispatch Motion Vector Compute Shader -> DXGI_FORMAT_R16G16_FLOAT
-    MotionVectorCameraCB cbData = camera.BuildMotionVectorCB();
-    context->UpdateSubresource(cameraCB_, 0, nullptr, &cbData, 0, 0);
-
-    ID3D11ShaderResourceView* csSrvs[1] = { depthCopySRV_ };
-    ID3D11UnorderedAccessView* csUavs[1] = { motionVecUAV_ };
-    ID3D11Buffer* csCbs[1] = { cameraCB_ };
-
-    context->CSSetShader(motionVecCS_, nullptr, 0);
-    context->CSSetConstantBuffers(0, 1, csCbs);
-    context->CSSetShaderResources(0, 1, csSrvs);
-    context->CSSetUnorderedAccessViews(0, 1, csUavs, nullptr);
-
-    UINT groupsX = (renderWidth_ + 7) / 8;
-    UINT groupsY = (renderHeight_ + 7) / 8;
-    context->Dispatch(groupsX, groupsY, 1);
-
-    // Unbind compute resources
     ID3D11ShaderResourceView* nullSrv[2] = { nullptr, nullptr };
     ID3D11UnorderedAccessView* nullUav[1] = { nullptr };
-    context->CSSetShaderResources(0, 1, nullSrv);
-    context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-    context->CSSetShader(nullptr, nullptr, 0);
 
-    // 2. Run AMD FidelityFX FSR 2/3 if enabled and SDK is compiled in
+    // 1. Dispatch Motion Vector Compute Shader -> DXGI_FORMAT_R16G16_FLOAT
+    //    Only run when needed (FFX SDK enabled or Motion Vectors debug view active) to save GPU time.
+#ifdef HAS_FFX_SDK
+    const bool needMotionVectors = fsrEnabled || (debugMode == DebugViewMode::MotionVectors);
+#else
+    const bool needMotionVectors = (debugMode == DebugViewMode::MotionVectors);
+#endif
+    if (needMotionVectors && capturedThisFrame_ && depthCopySRV_ && motionVecUAV_) {
+        MotionVectorCameraCB cbData = camera.BuildMotionVectorCB();
+        context->UpdateSubresource(cameraCB_, 0, nullptr, &cbData, 0, 0);
+
+        ID3D11ShaderResourceView* csSrvs[1] = { depthCopySRV_ };
+        ID3D11UnorderedAccessView* csUavs[1] = { motionVecUAV_ };
+        ID3D11Buffer* csCbs[1] = { cameraCB_ };
+
+        context->CSSetShader(motionVecCS_, nullptr, 0);
+        context->CSSetConstantBuffers(0, 1, csCbs);
+        context->CSSetShaderResources(0, 1, csSrvs);
+        context->CSSetUnorderedAccessViews(0, 1, csUavs, nullptr);
+
+        UINT groupsX = (renderWidth_ + 7) / 8;
+        UINT groupsY = (renderHeight_ + 7) / 8;
+        context->Dispatch(groupsX, groupsY, 1);
+
+        context->CSSetShaderResources(0, 1, nullSrv);
+        context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+        context->CSSetShader(nullptr, nullptr, 0);
+    }
+
+    // 2. Run FSR upscaling / RCAS sharpening if enabled
     if (fsrEnabled) {
 #ifdef HAS_FFX_SDK
-        D3D11_TEXTURE2D_DESC bbDesc{};
-        backbufferTex->GetDesc(&bbDesc);
-        if (InitFfxContext(renderWidth_, renderHeight_, bbDesc.Width, bbDesc.Height)) {
-            FfxFsr2DispatchDescription dd{};
-            dd.commandList = ffxGetCommandListDX11(context);
-            dd.color = ffxGetResourceDX11(&ffxContext_, colorCopyTex_, L"paws_color", FFX_RESOURCE_STATE_COMPUTE_READ);
-            dd.depth = ffxGetResourceDX11(&ffxContext_, depthCopyTex_, L"paws_depth", FFX_RESOURCE_STATE_COMPUTE_READ);
-            dd.motionVectors = ffxGetResourceDX11(&ffxContext_, motionVecTex_, L"paws_mv", FFX_RESOURCE_STATE_COMPUTE_READ);
-            dd.output = ffxGetResourceDX11(&ffxContext_, fsrOutputTex_, L"paws_out", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
-            dd.jitterOffset.x = camera.GetJitterPixelsX();
-            dd.jitterOffset.y = camera.GetJitterPixelsY();
-            dd.motionVectorScale.x = static_cast<float>(renderWidth_);
-            dd.motionVectorScale.y = static_cast<float>(renderHeight_);
-            dd.renderSize.width = renderWidth_;
-            dd.renderSize.height = renderHeight_;
-            dd.enableSharpening = true;
-            dd.sharpness = 0.2f;
-            dd.frameTimeDelta = camera.GetDeltaTimeMs();
-            dd.preExposure = 1.0f;
-            dd.reset = !camera.HasValidHistory();
-            dd.cameraNear = camera.GetNearPlane();
-            dd.cameraFar = camera.GetFarPlane();
-            dd.cameraFovAngleVertical = camera.GetFovYRadians();
+        if (capturedThisFrame_ && colorCopyTex_ && depthCopyTex_ && motionVecTex_) {
+            D3D11_TEXTURE2D_DESC bbDesc{};
+            backbufferTex->GetDesc(&bbDesc);
+            if (InitFfxContext(renderWidth_, renderHeight_, bbDesc.Width, bbDesc.Height)) {
+                FfxFsr2DispatchDescription dd{};
+                dd.commandList = ffxGetCommandListDX11(context);
+                dd.color = ffxGetResourceDX11(&ffxContext_, colorCopyTex_, L"paws_color", FFX_RESOURCE_STATE_COMPUTE_READ);
+                dd.depth = ffxGetResourceDX11(&ffxContext_, depthCopyTex_, L"paws_depth", FFX_RESOURCE_STATE_COMPUTE_READ);
+                dd.motionVectors = ffxGetResourceDX11(&ffxContext_, motionVecTex_, L"paws_mv", FFX_RESOURCE_STATE_COMPUTE_READ);
+                dd.output = ffxGetResourceDX11(&ffxContext_, fsrOutputTex_, L"paws_out", FFX_RESOURCE_STATE_UNORDERED_ACCESS);
+                dd.jitterOffset.x = camera.GetJitterPixelsX();
+                dd.jitterOffset.y = camera.GetJitterPixelsY();
+                dd.motionVectorScale.x = static_cast<float>(renderWidth_);
+                dd.motionVectorScale.y = static_cast<float>(renderHeight_);
+                dd.renderSize.width = renderWidth_;
+                dd.renderSize.height = renderHeight_;
+                dd.enableSharpening = true;
+                dd.sharpness = 0.2f;
+                dd.frameTimeDelta = camera.GetDeltaTimeMs();
+                dd.preExposure = 1.0f;
+                dd.reset = !camera.HasValidHistory();
+                dd.cameraNear = camera.GetNearPlane();
+                dd.cameraFar = camera.GetFarPlane();
+                dd.cameraFovAngleVertical = camera.GetFovYRadians();
 
-            if (ffxFsr2ContextDispatch(&ffxContext_, &dd) == FFX_OK && fsrOutputTex_) {
-                context->CopyResource(backbufferTex, fsrOutputTex_);
+                if (ffxFsr2ContextDispatch(&ffxContext_, &dd) == FFX_OK && fsrOutputTex_) {
+                    context->CopyResource(backbufferTex, fsrOutputTex_);
+                }
             }
         }
 #else
         if (!loggedSdkStatus_) {
-            PAWS_LOG("Native DX11 Temporal Upscaling + RCAS active (using depth-derived R16G16_FLOAT motion vectors).");
+            PAWS_LOG("Native DX11 FSR RCAS sharpening active on final lit backbuffer.");
             loggedSdkStatus_ = true;
         }
 
         D3D11_TEXTURE2D_DESC bbDesc{};
         backbufferTex->GetDesc(&bbDesc);
-        if (EnsureHistoryResources(bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
-            uint32_t readIdx = historyIndex_;
-            uint32_t writeIdx = 1u - historyIndex_;
-            if (temporalUpscaleCS_ && historySRV_[readIdx] && historyUAV_[writeIdx]) {
-                TemporalCBData tcb{};
-                tcb.renderSize[0] = static_cast<float>(renderWidth_);
-                tcb.renderSize[1] = static_cast<float>(renderHeight_);
-                tcb.invRenderSize[0] = 1.0f / tcb.renderSize[0];
-                tcb.invRenderSize[1] = 1.0f / tcb.renderSize[1];
-                tcb.displaySize[0] = static_cast<float>(displayWidth_);
-                tcb.displaySize[1] = static_cast<float>(displayHeight_);
-                tcb.invDisplaySize[0] = 1.0f / tcb.displaySize[0];
-                tcb.invDisplaySize[1] = 1.0f / tcb.displaySize[1];
-                tcb.sharpness = 0.25f;
-                tcb.resetHistory = historyValid_ ? 0 : 1;
-                context->UpdateSubresource(temporalCB_, 0, nullptr, &tcb, 0, 0);
+        if (EnsureHistoryResources(bbDesc.Width, bbDesc.Height, bbDesc.Format) &&
+            temporalUpscaleCS_ && historyTex_[0] && historySRV_[0] && historyUAV_[1] &&
+            bbDesc.Format == historyFormat_) {
 
-                ID3D11ShaderResourceView* tuSrvs[3] = { colorCopySRV_, motionVecSRV_, historySRV_[readIdx] };
-                ID3D11UnorderedAccessView* tuUavs[1] = { historyUAV_[writeIdx] };
-                ID3D11Buffer* tuCbs[1] = { temporalCB_ };
+            // Copy GTA V's final lit + skybox + post-FX + HUD backbuffer as RCAS input
+            context->CopyResource(historyTex_[0], backbufferTex);
 
-                context->CSSetShader(temporalUpscaleCS_, nullptr, 0);
-                context->CSSetConstantBuffers(0, 1, tuCbs);
-                context->CSSetShaderResources(0, 3, tuSrvs);
-                context->CSSetSamplers(0, 1, &linearSampler_);
-                context->CSSetUnorderedAccessViews(0, 1, tuUavs, nullptr);
-                context->Dispatch((displayWidth_ + 7) / 8, (displayHeight_ + 7) / 8, 1);
+            TemporalCBData tcb{};
+            tcb.renderSize[0] = static_cast<float>(displayWidth_);
+            tcb.renderSize[1] = static_cast<float>(displayHeight_);
+            tcb.invRenderSize[0] = 1.0f / tcb.renderSize[0];
+            tcb.invRenderSize[1] = 1.0f / tcb.renderSize[1];
+            tcb.displaySize[0] = static_cast<float>(displayWidth_);
+            tcb.displaySize[1] = static_cast<float>(displayHeight_);
+            tcb.invDisplaySize[0] = tcb.invRenderSize[0];
+            tcb.invDisplaySize[1] = tcb.invRenderSize[1];
+            tcb.sharpness = 0.2f;
+            tcb.resetHistory = 0;
+            context->UpdateSubresource(temporalCB_, 0, nullptr, &tcb, 0, 0);
 
-                ID3D11ShaderResourceView* nullSrvs3[3] = { nullptr, nullptr, nullptr };
-                context->CSSetShaderResources(0, 3, nullSrvs3);
-                context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-                context->CSSetShader(nullptr, nullptr, 0);
+            ID3D11ShaderResourceView* tuSrvs[1] = { historySRV_[0] };
+            ID3D11UnorderedAccessView* tuUavs[1] = { historyUAV_[1] };
+            ID3D11Buffer* tuCbs[1] = { temporalCB_ };
 
-                historyIndex_ = writeIdx;
-                historyValid_ = true;
+            context->CSSetShader(temporalUpscaleCS_, nullptr, 0);
+            context->CSSetConstantBuffers(0, 1, tuCbs);
+            context->CSSetShaderResources(0, 1, tuSrvs);
+            context->CSSetUnorderedAccessViews(0, 1, tuUavs, nullptr);
+            context->Dispatch((displayWidth_ + 7) / 8, (displayHeight_ + 7) / 8, 1);
 
-                if (bbDesc.Width == displayWidth_ && bbDesc.Height == displayHeight_ &&
-                    bbDesc.Format == historyFormat_) {
-                    context->CopyResource(backbufferTex, historyTex_[writeIdx]);
-                }
-            }
+            context->CSSetShaderResources(0, 1, nullSrv);
+            context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+            context->CSSetShader(nullptr, nullptr, 0);
+
+            context->CopyResource(backbufferTex, historyTex_[1]);
         }
 #endif
     }
 
     // 3. Render Debug View Overlay (Depth Buffer or Motion Vectors) if selected via F8
-    if (debugMode != DebugViewMode::Normal) {
+    if (debugMode != DebugViewMode::Normal && capturedThisFrame_ && depthCopySRV_ && motionVecSRV_) {
         ID3D11RenderTargetView* bbRTV = nullptr;
         if (SUCCEEDED(device_->CreateRenderTargetView(backbufferTex, nullptr, &bbRTV))) {
             D3D11_TEXTURE2D_DESC bbDesc{};
