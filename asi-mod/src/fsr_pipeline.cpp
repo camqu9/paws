@@ -202,6 +202,19 @@ void FsrPipeline::OnResize() {
     capturedThisFrame_ = false;
 }
 
+void FsrPipeline::ReleaseHistoryResources() {
+    for (int i = 0; i < 2; ++i) {
+        SafeRelease(historySRV_[i]);
+        SafeRelease(historyUAV_[i]);
+        SafeRelease(historyTex_[i]);
+    }
+    historyIndex_ = 0;
+    historyValid_ = false;
+    displayWidth_ = 0;
+    displayHeight_ = 0;
+    historyFormat_ = DXGI_FORMAT_UNKNOWN;
+}
+
 void FsrPipeline::ReleaseRenderResources() {
 #ifdef HAS_FFX_SDK
     DestroyFfxContext();
@@ -215,17 +228,53 @@ void FsrPipeline::ReleaseRenderResources() {
     SafeRelease(motionVecTex_);
     SafeRelease(fsrOutputUAV_);
     SafeRelease(fsrOutputTex_);
-    for (int i = 0; i < 2; ++i) {
-        SafeRelease(historySRV_[i]);
-        SafeRelease(historyUAV_[i]);
-        SafeRelease(historyTex_[i]);
-    }
-    historyIndex_ = 0;
-    historyValid_ = false;
+    ReleaseHistoryResources();
     renderWidth_ = 0;
     renderHeight_ = 0;
     colorFormat_ = DXGI_FORMAT_UNKNOWN;
     depthFormat_ = DXGI_FORMAT_UNKNOWN;
+}
+
+bool FsrPipeline::EnsureHistoryResources(uint32_t displayW, uint32_t displayH, DXGI_FORMAT bbFmt) {
+    if (!device_ || displayW == 0 || displayH == 0) return false;
+    DXGI_FORMAT fmt = (bbFmt == DXGI_FORMAT_B8G8R8A8_UNORM || bbFmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+                          ? DXGI_FORMAT_B8G8R8A8_UNORM
+                          : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (displayWidth_ == displayW && displayHeight_ == displayH && historyFormat_ == fmt &&
+        historyTex_[0] && historyTex_[1]) {
+        return true;
+    }
+
+    ReleaseHistoryResources();
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = displayW;
+    td.Height = displayH;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+
+    for (int i = 0; i < 2; ++i) {
+        if (FAILED(device_->CreateTexture2D(&td, nullptr, &historyTex_[i]))) {
+            ReleaseHistoryResources();
+            return false;
+        }
+        if (FAILED(device_->CreateShaderResourceView(historyTex_[i], nullptr, &historySRV_[i])) ||
+            FAILED(device_->CreateUnorderedAccessView(historyTex_[i], nullptr, &historyUAV_[i]))) {
+            ReleaseHistoryResources();
+            return false;
+        }
+    }
+
+    displayWidth_ = displayW;
+    displayHeight_ = displayH;
+    historyFormat_ = fmt;
+    PAWS_LOG("Allocated temporal upscaler history buffers: %ux%u (fmt=%d)",
+             displayW, displayH, static_cast<int>(fmt));
+    return true;
 }
 
 bool FsrPipeline::EnsureRenderResources(uint32_t width, uint32_t height, DXGI_FORMAT colorFmt, DXGI_FORMAT depthFmt) {
@@ -283,21 +332,13 @@ bool FsrPipeline::EnsureRenderResources(uint32_t width, uint32_t height, DXGI_FO
     device_->CreateUnorderedAccessView(motionVecTex_, nullptr, &motionVecUAV_);
     device_->CreateShaderResourceView(motionVecTex_, nullptr, &motionVecSRV_);
 
-    // FSR output texture + ping-pong temporal history textures
+    // FSR output texture
     D3D11_TEXTURE2D_DESC otd = ctd;
     otd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     otd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
     if (SUCCEEDED(device_->CreateTexture2D(&otd, nullptr, &fsrOutputTex_))) {
         device_->CreateUnorderedAccessView(fsrOutputTex_, nullptr, &fsrOutputUAV_);
     }
-    for (int i = 0; i < 2; ++i) {
-        if (SUCCEEDED(device_->CreateTexture2D(&otd, nullptr, &historyTex_[i]))) {
-            device_->CreateShaderResourceView(historyTex_[i], nullptr, &historySRV_[i]);
-            device_->CreateUnorderedAccessView(historyTex_[i], nullptr, &historyUAV_[i]);
-        }
-    }
-    historyIndex_ = 0;
-    historyValid_ = false;
 
     renderWidth_ = width;
     renderHeight_ = height;
@@ -444,46 +485,48 @@ void FsrPipeline::Execute(ID3D11DeviceContext* context,
             loggedSdkStatus_ = true;
         }
 
-        uint32_t readIdx = historyIndex_;
-        uint32_t writeIdx = 1u - historyIndex_;
-        if (temporalUpscaleCS_ && historySRV_[readIdx] && historyUAV_[writeIdx]) {
-            TemporalCBData tcb{};
-            tcb.renderSize[0] = static_cast<float>(renderWidth_);
-            tcb.renderSize[1] = static_cast<float>(renderHeight_);
-            tcb.invRenderSize[0] = 1.0f / tcb.renderSize[0];
-            tcb.invRenderSize[1] = 1.0f / tcb.renderSize[1];
-            tcb.displaySize[0] = static_cast<float>(renderWidth_);
-            tcb.displaySize[1] = static_cast<float>(renderHeight_);
-            tcb.invDisplaySize[0] = tcb.invRenderSize[0];
-            tcb.invDisplaySize[1] = tcb.invRenderSize[1];
-            tcb.sharpness = 0.25f;
-            tcb.resetHistory = historyValid_ ? 0 : 1;
-            context->UpdateSubresource(temporalCB_, 0, nullptr, &tcb, 0, 0);
+        D3D11_TEXTURE2D_DESC bbDesc{};
+        backbufferTex->GetDesc(&bbDesc);
+        if (EnsureHistoryResources(bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
+            uint32_t readIdx = historyIndex_;
+            uint32_t writeIdx = 1u - historyIndex_;
+            if (temporalUpscaleCS_ && historySRV_[readIdx] && historyUAV_[writeIdx]) {
+                TemporalCBData tcb{};
+                tcb.renderSize[0] = static_cast<float>(renderWidth_);
+                tcb.renderSize[1] = static_cast<float>(renderHeight_);
+                tcb.invRenderSize[0] = 1.0f / tcb.renderSize[0];
+                tcb.invRenderSize[1] = 1.0f / tcb.renderSize[1];
+                tcb.displaySize[0] = static_cast<float>(displayWidth_);
+                tcb.displaySize[1] = static_cast<float>(displayHeight_);
+                tcb.invDisplaySize[0] = 1.0f / tcb.displaySize[0];
+                tcb.invDisplaySize[1] = 1.0f / tcb.displaySize[1];
+                tcb.sharpness = 0.25f;
+                tcb.resetHistory = historyValid_ ? 0 : 1;
+                context->UpdateSubresource(temporalCB_, 0, nullptr, &tcb, 0, 0);
 
-            ID3D11ShaderResourceView* tuSrvs[3] = { colorCopySRV_, motionVecSRV_, historySRV_[readIdx] };
-            ID3D11UnorderedAccessView* tuUavs[1] = { historyUAV_[writeIdx] };
-            ID3D11Buffer* tuCbs[1] = { temporalCB_ };
+                ID3D11ShaderResourceView* tuSrvs[3] = { colorCopySRV_, motionVecSRV_, historySRV_[readIdx] };
+                ID3D11UnorderedAccessView* tuUavs[1] = { historyUAV_[writeIdx] };
+                ID3D11Buffer* tuCbs[1] = { temporalCB_ };
 
-            context->CSSetShader(temporalUpscaleCS_, nullptr, 0);
-            context->CSSetConstantBuffers(0, 1, tuCbs);
-            context->CSSetShaderResources(0, 3, tuSrvs);
-            context->CSSetSamplers(0, 1, &linearSampler_);
-            context->CSSetUnorderedAccessViews(0, 1, tuUavs, nullptr);
-            context->Dispatch(groupsX, groupsY, 1);
+                context->CSSetShader(temporalUpscaleCS_, nullptr, 0);
+                context->CSSetConstantBuffers(0, 1, tuCbs);
+                context->CSSetShaderResources(0, 3, tuSrvs);
+                context->CSSetSamplers(0, 1, &linearSampler_);
+                context->CSSetUnorderedAccessViews(0, 1, tuUavs, nullptr);
+                context->Dispatch((displayWidth_ + 7) / 8, (displayHeight_ + 7) / 8, 1);
 
-            ID3D11ShaderResourceView* nullSrvs3[3] = { nullptr, nullptr, nullptr };
-            context->CSSetShaderResources(0, 3, nullSrvs3);
-            context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
-            context->CSSetShader(nullptr, nullptr, 0);
+                ID3D11ShaderResourceView* nullSrvs3[3] = { nullptr, nullptr, nullptr };
+                context->CSSetShaderResources(0, 3, nullSrvs3);
+                context->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+                context->CSSetShader(nullptr, nullptr, 0);
 
-            historyIndex_ = writeIdx;
-            historyValid_ = true;
+                historyIndex_ = writeIdx;
+                historyValid_ = true;
 
-            D3D11_TEXTURE2D_DESC bbDesc{};
-            backbufferTex->GetDesc(&bbDesc);
-            if (bbDesc.Width == renderWidth_ && bbDesc.Height == renderHeight_ &&
-                bbDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM) {
-                context->CopyResource(backbufferTex, historyTex_[writeIdx]);
+                if (bbDesc.Width == displayWidth_ && bbDesc.Height == displayHeight_ &&
+                    bbDesc.Format == historyFormat_) {
+                    context->CopyResource(backbufferTex, historyTex_[writeIdx]);
+                }
             }
         }
 #endif

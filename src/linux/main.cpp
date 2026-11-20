@@ -23,6 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -519,16 +520,126 @@ void RemoveAsiLinux(const fs::path& dstAsi) {
     }
 }
 
-int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
+fs::path FindGtaVSettingsXmlLinux() {
+    const char* homeEnv = std::getenv("HOME");
+    if (!homeEnv) return {};
+    fs::path home(homeEnv);
+
+    std::vector<fs::path> steamLibs;
+    steamLibs.push_back(home / ".local/share/Steam");
+
+    // Parse Steam libraryfolders.vdf to discover external SteamLibrary drives
+    fs::path vdfPath = home / ".local/share/Steam/steamapps/libraryfolders.vdf";
+    std::ifstream vdf(vdfPath);
+    if (vdf) {
+        std::string line;
+        std::regex pathRe("\"path\"\\s+\"([^\"]+)\"");
+        while (std::getline(vdf, line)) {
+            std::smatch m;
+            if (std::regex_search(line, m, pathRe)) {
+                steamLibs.emplace_back(m[1].str());
+            }
+        }
+    }
+
+    const fs::path relSettings =
+        "steamapps/compatdata/271590/pfx/drive_c/users/steamuser/Documents/Rockstar Games/GTA V/settings.xml";
+    for (const auto& lib : steamLibs) {
+        fs::path candidate = lib / relSettings;
+        std::error_code ec;
+        if (fs::exists(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+const char* SamplingModeLabel(int mode) {
+    switch (mode) {
+        case 1: return "1/2 (50% - Performance)";
+        case 2: return "2/3 (67% - Quality)";
+        case 3: return "3/4 (75% - Ultra Quality)";
+        case 4: return "5/6 (83% - Native-Like)";
+        default: return "Custom";
+    }
+}
+
+bool ApplyGtaVSettingsLinux(const fs::path& settingsPath, int samplingMode) {
+    if (settingsPath.empty() || !fs::exists(settingsPath)) return false;
+
+    fs::path backupPath = settingsPath;
+    backupPath += ".paws.bak";
+
+    std::error_code ec;
+    // Only create backup if one doesn't already exist (preserves true original settings)
+    if (!fs::exists(backupPath, ec)) {
+        if (!fs::copy_file(settingsPath, backupPath, fs::copy_options::overwrite_existing, ec)) {
+            std::cerr << "[paws] WARNING: Could not back up settings.xml (" << ec.message() << ")\n";
+            return false;
+        }
+    }
+
+    std::ifstream in(backupPath, std::ios::binary);
+    if (!in) return false;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    std::string patched = std::regex_replace(
+        content,
+        std::regex("<SamplingMode\\s+value=\"[^\"]*\"\\s*/>"),
+        "<SamplingMode value=\"" + std::to_string(samplingMode) + "\" />");
+
+    patched = std::regex_replace(
+        patched,
+        std::regex("<FXAA_Enabled\\s+value=\"true\"\\s*/>"),
+        "<FXAA_Enabled value=\"false\" />");
+
+    std::ofstream out(settingsPath, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(patched.data(), static_cast<std::streamsize>(patched.size()));
+    out.close();
+
+    std::cout << "[paws] Applied GTA V upscaling settings -> Frame Scaling: "
+              << SamplingModeLabel(samplingMode) << ", FXAA: OFF\n"
+              << "       (Original backed up to: " << backupPath.filename().string() << ")\n";
+    return true;
+}
+
+void RestoreGtaVSettingsLinux(const fs::path& settingsPath) {
+    if (settingsPath.empty()) return;
+    fs::path backupPath = settingsPath;
+    backupPath += ".paws.bak";
+    std::error_code ec;
+    if (fs::exists(backupPath, ec)) {
+        if (fs::copy_file(backupPath, settingsPath, fs::copy_options::overwrite_existing, ec)) {
+            fs::remove(backupPath, ec);
+            std::cout << "[paws] Restored original GTA V settings.xml cleanly.\n";
+        } else {
+            std::cerr << "[paws] WARNING: Failed to restore settings.xml (" << ec.message() << ")\n";
+        }
+    }
+}
+
+int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) {
     std::signal(SIGINT, HandleSignal);
     std::signal(SIGTERM, HandleSignal);
 
     fs::path srcAsi = ResolveAsiSourceLinux(customAsiPath);
+    fs::path settingsPath = FindGtaVSettingsXmlLinux();
+
     std::cout << "[paws] Live GTA V watcher active (Linux / Proton / Wine).\n"
               << "[paws] Source ASI: " << srcAsi.string()
-              << (fs::exists(srcAsi) ? " (found)\n" : " (NOT found yet — place Windows-built paws_gtav.asi here or pass --asi <path>)\n")
-              << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
-              << "[paws] Press Ctrl+C to stop watching.\n";
+              << (fs::exists(srcAsi) ? " (found)\n" : " (NOT found yet — place Windows-built paws_gtav.asi here or pass --asi <path>)\n");
+
+    if (!settingsPath.empty()) {
+        std::cout << "[paws] Found GTA V settings.xml: " << settingsPath.string() << "\n";
+        ApplyGtaVSettingsLinux(settingsPath, samplingMode);
+    } else {
+        std::cout << "[paws] Note: GTA V settings.xml not found yet (is your SteamLibrary drive mounted?).\n";
+    }
+
+    std::cout << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
+              << "[paws] Press Ctrl+C to stop watching (original settings.xml will be restored).\n";
 
     bool active = false;
     fs::path deployedAsi;
@@ -540,6 +651,14 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
 
         if (running && !active) {
             std::cout << "\n[paws] Detected GTA V starting (PID " << pid << ") in: " << gameDir.string() << "\n";
+
+            if (settingsPath.empty()) {
+                settingsPath = FindGtaVSettingsXmlLinux();
+            }
+            if (!settingsPath.empty() && !fs::exists(settingsPath.string() + ".paws.bak")) {
+                ApplyGtaVSettingsLinux(settingsPath, samplingMode);
+            }
+
             fs::path dstAsi = gameDir / "paws_gtav.asi";
             fs::path src = ResolveAsiSourceLinux(customAsiPath);
 
@@ -565,11 +684,12 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
             } else {
                 std::cout << "[paws] Verified dinput8.dll in GTA V folder.\n";
             }
-            std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi when GTA V closes.\n";
+            std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi & restore settings.xml when GTA V closes.\n";
             active = true;
         } else if (!running && active) {
             std::cout << "\n[paws] Detected GTA V closed.\n";
             RemoveAsiLinux(deployedAsi);
+            RestoreGtaVSettingsLinux(settingsPath);
             deployedAsi.clear();
             active = false;
             std::cout << "[paws] Resuming watch for GTA V...\n";
@@ -585,6 +705,7 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
             RemoveAsiLinux(deployedAsi);
         }
     }
+    RestoreGtaVSettingsLinux(settingsPath);
     std::cout << "\n[paws] Watcher stopped.\n";
     return 0;
 }
@@ -592,9 +713,13 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath) {
 void PrintUsage() {
     std::cout << "paws - Universal FSR 1.0 Spatial Upscaler & Live GTA V ASI Watcher (Linux)\n"
               << "Usage:\n"
-              << "  paws                                          (live-watch for GTA V, auto-add & auto-remove paws_gtav.asi)\n"
-              << "  paws --watch-gtav [--asi <path/paws_gtav.asi>]\n"
+              << "  paws [--scale <1|2|3>]                        (live-watch GTA V: sets Frame Scaling, adds ASI, restores all on exit)\n"
+              << "  paws --watch-gtav [--scale <1|2|3>] [--asi <path/paws_gtav.asi>]\n"
               << "  paws <path-to-executable-or-window-title> [--sharpness <0.0-2.0>]\n\n"
+              << "Scale Presets (--scale):\n"
+              << "  1 = 1/2 (50% - Performance, highest FPS)\n"
+              << "  2 = 2/3 (67% - Quality, default)\n"
+              << "  3 = 3/4 (75% - Ultra Quality)\n\n"
               << "Hotkeys (FSR 1.0 Overlay):\n"
               << "  F8   Toggle RCAS sharpening on/off\n"
               << "  End  Quit overlay\n";
@@ -604,12 +729,13 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        return RunGtaVLiveWatcherLinux("");
+        return RunGtaVLiveWatcherLinux("", 2);
     }
 
     std::string targetArg;
     std::string customAsiPath;
     float sharpness = 0.2f;
+    int samplingMode = 2; // Default: 2/3 (67% FSR Quality)
     bool watchGtaV = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -621,6 +747,9 @@ int main(int argc, char** argv) {
             watchGtaV = true;
         } else if (a == "--asi" && i + 1 < argc) {
             customAsiPath = argv[++i];
+        } else if (a == "--scale" && i + 1 < argc) {
+            samplingMode = std::clamp(std::stoi(argv[++i]), 1, 4);
+            watchGtaV = true;
         } else if (a == "--sharpness" && i + 1 < argc) {
             sharpness = std::stof(argv[++i]);
         } else if (targetArg.empty()) {
@@ -629,7 +758,7 @@ int main(int argc, char** argv) {
     }
 
     if (watchGtaV || ToLower(fs::path(targetArg).filename().string()) == "gta5.exe") {
-        return RunGtaVLiveWatcherLinux(customAsiPath);
+        return RunGtaVLiveWatcherLinux(customAsiPath, samplingMode);
     }
 
     if (targetArg.empty()) {

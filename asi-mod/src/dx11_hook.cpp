@@ -142,8 +142,7 @@ void STDMETHODCALLTYPE Hooked_OMSetRenderTargets(
                     if (cDesc.Width >= 640 && cDesc.Height >= 360 &&
                         cDesc.Width == dDesc.Width && cDesc.Height == dDesc.Height &&
                         IsTargetDepthFormat(dDesc.Format)) {
-                        if (cDesc.Width != g_LastLoggedW || cDesc.Height != g_LastLoggedH ||
-                            cDesc.Format != g_LastLoggedColorFmt || dDesc.Format != g_LastLoggedDepthFmt) {
+                        if (cDesc.Width != g_LastLoggedW || cDesc.Height != g_LastLoggedH) {
                             g_LastLoggedW = cDesc.Width;
                             g_LastLoggedH = cDesc.Height;
                             g_LastLoggedColorFmt = cDesc.Format;

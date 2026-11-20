@@ -22,7 +22,9 @@
 #include <cstring>
 #include <cwctype>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <regex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -197,6 +199,64 @@ void CheckAsiLoader(const fs::path& gameDir) {
 
 volatile bool g_WatcherStop = false;
 fs::path g_ActiveDeployedAsi;
+fs::path g_ActiveSettingsXml;
+
+fs::path FindGtaVSettingsXmlWindows() {
+    wchar_t profile[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return {};
+    fs::path p = fs::path(profile) / L"Documents" / L"Rockstar Games" / L"GTA V" / L"settings.xml";
+    std::error_code ec;
+    if (fs::exists(p, ec)) return p;
+    return {};
+}
+
+bool ApplyGtaVSettingsWindows(const fs::path& settingsPath, int samplingMode) {
+    if (settingsPath.empty() || !fs::exists(settingsPath)) return false;
+    fs::path backupPath = settingsPath;
+    backupPath += L".paws.bak";
+    std::error_code ec;
+    if (!fs::exists(backupPath, ec)) {
+        if (!fs::copy_file(settingsPath, backupPath, fs::copy_options::overwrite_existing, ec)) {
+            return false;
+        }
+    }
+    std::ifstream in(backupPath, std::ios::binary);
+    if (!in) return false;
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    in.close();
+
+    std::string patched = std::regex_replace(
+        content,
+        std::regex("<SamplingMode\\s+value=\"[^\"]*\"\\s*/>"),
+        "<SamplingMode value=\"" + std::to_string(samplingMode) + "\" />");
+    patched = std::regex_replace(
+        patched,
+        std::regex("<FXAA_Enabled\\s+value=\"true\"\\s*/>"),
+        "<FXAA_Enabled value=\"false\" />");
+
+    std::ofstream out(settingsPath, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(patched.data(), static_cast<std::streamsize>(patched.size()));
+    out.close();
+
+    std::cout << "[paws] Applied GTA V upscaling settings (SamplingMode=" << samplingMode
+              << ", FXAA=OFF; backup saved).\n";
+    return true;
+}
+
+void RestoreGtaVSettingsWindows(const fs::path& settingsPath) {
+    if (settingsPath.empty()) return;
+    fs::path backupPath = settingsPath;
+    backupPath += L".paws.bak";
+    std::error_code ec;
+    if (fs::exists(backupPath, ec)) {
+        if (fs::copy_file(backupPath, settingsPath, fs::copy_options::overwrite_existing, ec)) {
+            fs::remove(backupPath, ec);
+            std::cout << "[paws] Restored original GTA V settings.xml cleanly.\n";
+        }
+    }
+}
 
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_CLOSE_EVENT || ctrlType == CTRL_BREAK_EVENT) {
@@ -204,6 +264,7 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
         if (!g_ActiveDeployedAsi.empty() && !IsAnyGtaVRunning()) {
             RemoveAsiFromGtaDir(g_ActiveDeployedAsi);
         }
+        RestoreGtaVSettingsWindows(g_ActiveSettingsXml);
         return TRUE;
     }
     return FALSE;
@@ -264,11 +325,17 @@ HWND FindWindowByTitle(const std::wstring& query) {
 // ============================================================================
 // Smart Launcher: GTA V Legacy Auto-Deployment, Direct Launch & Auto-Cleanup
 // ============================================================================
-int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD runningPid) {
+int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD runningPid, int samplingMode = 2) {
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
     std::cout << "[paws] GTA V Legacy detected (" << WideToUtf8(gtaExePath.wstring()) << ")\n";
     std::cout << "[paws] Routing to internal DX11 FSR 2/3 ASI plugin (paws_gtav.asi) instead of FSR 1.0 overlay.\n";
+
+    fs::path settingsPath = FindGtaVSettingsXmlWindows();
+    g_ActiveSettingsXml = settingsPath;
+    if (!alreadyRunning && !settingsPath.empty()) {
+        ApplyGtaVSettingsWindows(settingsPath, samplingMode);
+    }
 
     fs::path gameDir = gtaExePath.parent_path();
     fs::path dstAsi;
@@ -288,6 +355,7 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
         if (!IsAnyGtaVRunning()) {
             std::cout << "[paws] GTA V closed.\n";
             RemoveAsiFromGtaDir(dstAsi);
+            RestoreGtaVSettingsWindows(settingsPath);
             g_ActiveDeployedAsi.clear();
         }
         return 0;
@@ -307,6 +375,7 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
                         0, nullptr, workDir.c_str(), &si, &pi)) {
         std::cerr << "[paws] ERROR: CreateProcessW failed for GTA5.exe (error " << GetLastError() << ").\n";
         RemoveAsiFromGtaDir(dstAsi);
+        RestoreGtaVSettingsWindows(settingsPath);
         g_ActiveDeployedAsi.clear();
         return 1;
     }
@@ -331,6 +400,7 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
               << " after " << elapsed << "s.\n";
 
     RemoveAsiFromGtaDir(dstAsi);
+    RestoreGtaVSettingsWindows(settingsPath);
     g_ActiveDeployedAsi.clear();
     return static_cast<int>(exitCode);
 }
@@ -338,15 +408,21 @@ int RunGtaVSmartLauncher(const fs::path& gtaExePath, bool alreadyRunning, DWORD 
 // ============================================================================
 // Live GTA V Auto-Watcher:
 // Watches for GTA V launching (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe),
-// immediately deploys paws_gtav.asi into the GTA V folder, and automatically
-// removes paws_gtav.asi as soon as GTA V closes.
+// patches settings.xml (Frame Scaling + FXAA off), deploys paws_gtav.asi,
+// and restores settings.xml + removes paws_gtav.asi as soon as GTA V closes.
 // ============================================================================
-int RunGtaVLiveWatcher() {
+int RunGtaVLiveWatcher(int samplingMode = 2) {
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
+
+    fs::path settingsPath = FindGtaVSettingsXmlWindows();
+    g_ActiveSettingsXml = settingsPath;
+    if (!settingsPath.empty()) {
+        ApplyGtaVSettingsWindows(settingsPath, samplingMode);
+    }
 
     std::cout << "[paws] Live GTA V watcher active.\n"
               << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
-              << "[paws] Press Ctrl+C or END to stop watching.\n";
+              << "[paws] Press Ctrl+C or END to stop watching (original settings.xml will be restored).\n";
 
     bool active = false;
     fs::path deployedAsi;
@@ -366,16 +442,20 @@ int RunGtaVLiveWatcher() {
                 fs::path gameDir = exePath.parent_path();
                 std::cout << "\n[paws] Detected GTA V starting (PID " << pid << "): "
                           << WideToUtf8(exePath.wstring()) << "\n";
+                if (!settingsPath.empty() && !fs::exists(settingsPath.wstring() + L".paws.bak")) {
+                    ApplyGtaVSettingsWindows(settingsPath, samplingMode);
+                }
                 if (DeployAsiToGtaDir(gameDir, deployedAsi)) {
                     g_ActiveDeployedAsi = deployedAsi;
                 }
                 CheckAsiLoader(gameDir);
-                std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi when GTA V closes.\n";
+                std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi & restore settings.xml on close.\n";
                 active = true;
             }
         } else if (!running && active) {
             std::cout << "\n[paws] Detected GTA V closed.\n";
             RemoveAsiFromGtaDir(deployedAsi);
+            RestoreGtaVSettingsWindows(settingsPath);
             deployedAsi.clear();
             g_ActiveDeployedAsi.clear();
             active = false;
@@ -389,6 +469,7 @@ int RunGtaVLiveWatcher() {
         RemoveAsiFromGtaDir(deployedAsi);
         g_ActiveDeployedAsi.clear();
     }
+    RestoreGtaVSettingsWindows(settingsPath);
     return 0;
 }
 

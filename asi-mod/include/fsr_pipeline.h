@@ -40,7 +40,9 @@ public:
 
 private:
     bool EnsureRenderResources(uint32_t width, uint32_t height, DXGI_FORMAT colorFmt, DXGI_FORMAT depthFmt);
+    bool EnsureHistoryResources(uint32_t displayW, uint32_t displayH, DXGI_FORMAT bbFmt);
     void ReleaseRenderResources();
+    void ReleaseHistoryResources();
 
     static DXGI_FORMAT DepthToSrvFormat(DXGI_FORMAT fmt);
     static DXGI_FORMAT DepthToTypelessFormat(DXGI_FORMAT fmt);
@@ -54,6 +56,10 @@ private:
     uint32_t renderHeight_ = 0;
     DXGI_FORMAT colorFormat_ = DXGI_FORMAT_UNKNOWN;
     DXGI_FORMAT depthFormat_ = DXGI_FORMAT_UNKNOWN;
+
+    uint32_t displayWidth_ = 0;
+    uint32_t displayHeight_ = 0;
+    DXGI_FORMAT historyFormat_ = DXGI_FORMAT_UNKNOWN;
 
     // Shaders & pipeline states
     ID3D11ComputeShader* motionVecCS_ = nullptr;
