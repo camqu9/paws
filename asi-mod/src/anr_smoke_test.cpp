@@ -37,8 +37,14 @@ int main() {
 
     ID3D11Texture2D* inTex = nullptr;
     ID3D11Texture2D* outTex = nullptr;
+    ID3D11Texture2D* readTex = nullptr;
     dev->CreateTexture2D(&td, nullptr, &inTex);
     dev->CreateTexture2D(&td, nullptr, &outTex);
+    D3D11_TEXTURE2D_DESC rtd = td;
+    rtd.Usage = D3D11_USAGE_STAGING;
+    rtd.BindFlags = 0;
+    rtd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    dev->CreateTexture2D(&rtd, nullptr, &readTex);
 
     paws::AnrFrameGen fg;
     fg.SetModuleDirectory(exeDir.wstring());
@@ -50,9 +56,11 @@ int main() {
     std::vector<uint32_t> pixels(W * H, 0xFF336699u);
     for (int f = 0; f < 5; ++f) {
         // Shift bright vertical stripe each frame so ANR FG has real motion to interpolate
+        UINT stripeStart = 100 + f * 40;
+        UINT stripeEnd = 200 + f * 40;
         std::fill(pixels.begin(), pixels.end(), 0xFF203040u);
         for (UINT y = 0; y < H; ++y) {
-            for (UINT x = 100 + f * 40; x < 200 + f * 40; ++x) {
+            for (UINT x = stripeStart; x < stripeEnd; ++x) {
                 pixels[y * W + x] = 0xFFE0A040u;
             }
         }
@@ -62,10 +70,31 @@ int main() {
         bool produced = fg.GenerateFrame(ctx, inTex, outTex);
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        std::printf("[smoke] frame %d: produced=%d time=%.2f ms\n", f, produced ? 1 : 0, ms);
+
+        // Read back middle row of outTex to verify where ANR placed the interpolated stripe!
+        ctx->CopyResource(readTex, outTex);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        int minX = -1, maxX = -1;
+        uint32_t midPix = 0;
+        if (SUCCEEDED(ctx->Map(readTex, 0, D3D11_MAP_READ, 0, &mapped))) {
+            const uint32_t* row = reinterpret_cast<const uint32_t*>(
+                static_cast<const uint8_t*>(mapped.pData) + (H / 2) * mapped.RowPitch);
+            midPix = row[0];
+            for (UINT x = 0; x < W; ++x) {
+                uint32_t r = (row[x] >> 16) & 0xFF;
+                if (r > 120) {
+                    if (minX < 0) minX = static_cast<int>(x);
+                    maxX = static_cast<int>(x);
+                }
+            }
+            ctx->Unmap(readTex, 0);
+        }
+        std::printf("[smoke] frame %d: in=[%u..%u] out=[%d..%d] bg=0x%08X produced=%d time=%.2f ms\n",
+                    f, stripeStart, stripeEnd, minX, maxX, midPix, produced ? 1 : 0, ms);
     }
 
     fg.Shutdown();
+    readTex->Release();
     inTex->Release();
     outTex->Release();
     ctx->Release();
