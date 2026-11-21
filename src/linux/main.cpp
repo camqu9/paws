@@ -564,7 +564,7 @@ const char* SamplingModeLabel(int mode) {
     }
 }
 
-bool ApplyGtaVSettingsLinux(const fs::path& settingsPath, int samplingMode) {
+bool ApplyGtaVSettingsLinux(const fs::path& settingsPath, int targetW, int targetH, int samplingMode) {
     if (settingsPath.empty() || !fs::exists(settingsPath)) return false;
 
     fs::path backupPath = settingsPath;
@@ -584,24 +584,34 @@ bool ApplyGtaVSettingsLinux(const fs::path& settingsPath, int samplingMode) {
     std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     in.close();
 
-    std::string patched = std::regex_replace(
-        content,
-        std::regex("<SamplingMode\\s+value=\"[^\"]*\"\\s*/>"),
-        "<SamplingMode value=\"" + std::to_string(samplingMode) + "\" />");
+    std::string patched = content;
+    if (targetW > 0 && targetH > 0) {
+        patched = std::regex_replace(
+            patched,
+            std::regex("<ScreenWidth\\s+value=\"[^\"]*\"\\s*/>"),
+            "<ScreenWidth value=\"" + std::to_string(targetW) + "\" />");
+        patched = std::regex_replace(
+            patched,
+            std::regex("<ScreenHeight\\s+value=\"[^\"]*\"\\s*/>"),
+            "<ScreenHeight value=\"" + std::to_string(targetH) + "\" />");
+    }
 
-    patched = std::regex_replace(
-        patched,
-        std::regex("<FXAA_Enabled\\s+value=\"true\"\\s*/>"),
-        "<FXAA_Enabled value=\"false\" />");
+    if (samplingMode > 0) {
+        patched = std::regex_replace(
+            patched,
+            std::regex("<SamplingMode\\s+value=\"[^\"]*\"\\s*/>"),
+            "<SamplingMode value=\"" + std::to_string(samplingMode) + "\" />");
+    }
 
     std::ofstream out(settingsPath, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     out.write(patched.data(), static_cast<std::streamsize>(patched.size()));
     out.close();
 
-    std::cout << "[paws] Applied GTA V upscaling settings -> Frame Scaling: "
-              << SamplingModeLabel(samplingMode) << ", FXAA: OFF\n"
-              << "       (Original backed up to: " << backupPath.filename().string() << ")\n";
+    std::cout << "[paws] Applied GTA V settings -> Resolution: " << targetW << "x" << targetH;
+    if (samplingMode > 0) std::cout << ", Frame Scaling: " << SamplingModeLabel(samplingMode);
+    std::cout << "\n       (Original backed up to: " << backupPath.filename().string()
+              << " and will auto-restore on exit)\n";
     return true;
 }
 
@@ -634,13 +644,11 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
               << "[paws] ANR FG dir: " << srcAnrDir.string()
               << (fs::exists(srcAnrDir / "nvngx_dlssg.dll") ? " (found - ANR 2X AI Frame Gen ready!)\n" : " (not present - will use FSR RCAS)\n");
 
-    if (samplingMode > 0) {
-        if (!settingsPath.empty()) {
-            std::cout << "[paws] Found GTA V settings.xml: " << settingsPath.string() << "\n";
-            ApplyGtaVSettingsLinux(settingsPath, samplingMode);
-        } else {
-            std::cout << "[paws] Note: GTA V settings.xml not found yet (is your SteamLibrary drive mounted?).\n";
-        }
+    if (!settingsPath.empty()) {
+        std::cout << "[paws] Found GTA V settings.xml: " << settingsPath.string() << "\n";
+        ApplyGtaVSettingsLinux(settingsPath, 1920, 1080, samplingMode);
+    } else {
+        std::cout << "[paws] Note: GTA V settings.xml not found yet (is your SteamLibrary drive mounted?).\n";
     }
 
     std::cout << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
@@ -669,11 +677,9 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
         if (running && !active) {
             std::cout << "\n[paws] Detected GTA V starting (PID " << pid << ") in: " << gameDir.string() << "\n";
 
-            if (samplingMode > 0) {
-                if (settingsPath.empty()) settingsPath = FindGtaVSettingsXmlLinux();
-                if (!settingsPath.empty() && !fs::exists(settingsPath.string() + ".paws.bak")) {
-                    ApplyGtaVSettingsLinux(settingsPath, samplingMode);
-                }
+            if (settingsPath.empty()) settingsPath = FindGtaVSettingsXmlLinux();
+            if (!settingsPath.empty() && !fs::exists(settingsPath.string() + ".paws.bak")) {
+                ApplyGtaVSettingsLinux(settingsPath, 1920, 1080, samplingMode);
             }
 
             // Live-deploy ANR_FG directory (symlink for instant zero-copy deploy)
