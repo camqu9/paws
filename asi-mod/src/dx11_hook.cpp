@@ -101,6 +101,9 @@ bool g_PrevF8 = false;
 bool g_PrevF9 = false;
 
 auto g_LastFrameTime = std::chrono::steady_clock::now();
+auto g_FirstPresentTime = std::chrono::steady_clock::time_point{};
+bool g_HasFirstPresent = false;
+bool g_LoggedAnrDelay = false;
 auto g_FpsLogTimer = std::chrono::steady_clock::now();
 int g_FpsFrameCount = 0;
 
@@ -290,6 +293,11 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
 
         // Frame timing & Halton jitter advance
         auto now = std::chrono::steady_clock::now();
+        if (!g_HasFirstPresent) {
+            g_FirstPresentTime = now;
+            g_HasFirstPresent = true;
+        }
+        double secsSinceStart = std::chrono::duration<double>(now - g_FirstPresentTime).count();
         float dtMs = std::chrono::duration<float, std::milli>(now - g_LastFrameTime).count();
         g_LastFrameTime = now;
 
@@ -308,10 +316,18 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
             }
             ReleasePendingBuffers();
 
+            // Delay ANR FG D3D12 init by 12s so Rockstar Social Club's RgscUi::OnCreateDevice
+            // initializes cleanly on DX11 without Error Code 17.
             bool anrHandled = false;
             if (g_FsrEnabled && g_DebugMode == DebugViewMode::Normal && !g_AnrFg.HasFailedPermanently()) {
-                if (g_AnrFg.EnsureReady(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format) &&
-                    EnsureFgBuffers(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
+                if (secsSinceStart < 12.0) {
+                    if (!g_LoggedAnrDelay) {
+                        PAWS_LOG("ANR FG: Waiting 12s for Social Club SDK DX11 init before starting D3D12...");
+                        g_LoggedAnrDelay = true;
+                    }
+                    anrHandled = true; // Pure passthrough during startup
+                } else if (g_AnrFg.EnsureReady(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format) &&
+                           EnsureFgBuffers(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
                     g_Context->CopyResource(g_RealFrameBackup, backbuffer);
                     if (g_AnrFg.GenerateFrame(g_Context, g_RealFrameBackup, g_InterpFrameTex)) {
                         g_Context->CopyResource(backbuffer, g_InterpFrameTex);
