@@ -603,12 +603,18 @@ bool ApplyGtaVSettingsLinux(const fs::path& settingsPath, int targetW, int targe
             "<SamplingMode value=\"" + std::to_string(samplingMode) + "\" />");
     }
 
+    // Disable VSync during ANR 2X Frame Gen so Present() doesn't snap real frames down to 1/3 refresh (33 FPS)
+    patched = std::regex_replace(
+        patched,
+        std::regex("<VSync\\s+value=\"[^\"]*\"\\s*/>"),
+        "<VSync value=\"0\" />");
+
     std::ofstream out(settingsPath, std::ios::binary | std::ios::trunc);
     if (!out) return false;
     out.write(patched.data(), static_cast<std::streamsize>(patched.size()));
     out.close();
 
-    std::cout << "[paws] Applied GTA V settings -> Resolution: " << targetW << "x" << targetH;
+    std::cout << "[paws] Applied GTA V settings -> Resolution: " << targetW << "x" << targetH << ", VSync: OFF";
     if (samplingMode > 0) std::cout << ", Frame Scaling: " << SamplingModeLabel(samplingMode);
     std::cout << "\n       (Original backed up to: " << backupPath.filename().string()
               << " and will auto-restore on exit)\n";
