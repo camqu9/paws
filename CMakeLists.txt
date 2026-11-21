@@ -41,6 +41,7 @@ if(WIN32)
     # 2. Embed HLSL compute shaders into generated headers
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/asi-mod/shaders/motion_vectors.hlsl" PAWS_MV_HLSL_CONTENT)
     file(READ "${CMAKE_CURRENT_SOURCE_DIR}/asi-mod/shaders/temporal_upscale.hlsl" PAWS_TU_HLSL_CONTENT)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/asi-mod/shaders/optical_flow.hlsl" PAWS_OF_HLSL_CONTENT)
     set(PAWS_GENERATED_DIR "${CMAKE_BINARY_DIR}/generated")
     file(MAKE_DIRECTORY "${PAWS_GENERATED_DIR}")
     file(WRITE "${PAWS_GENERATED_DIR}/motion_vectors_shader.h"
@@ -56,6 +57,14 @@ if(WIN32)
         "namespace paws {\n"
         "static constexpr const char* kTemporalUpscaleHlsl = R\"PAWS_HLSL(\n"
         "${PAWS_TU_HLSL_CONTENT}\n"
+        ")PAWS_HLSL\";\n"
+        "} // namespace paws\n"
+    )
+    file(WRITE "${PAWS_GENERATED_DIR}/optical_flow_shader.h"
+        "#pragma once\n"
+        "namespace paws {\n"
+        "static constexpr const char* kOpticalFlowHlsl = R\"PAWS_HLSL(\n"
+        "${PAWS_OF_HLSL_CONTENT}\n"
         ")PAWS_HLSL\";\n"
         "} // namespace paws\n"
     )
@@ -93,10 +102,12 @@ if(WIN32)
     )
     target_include_directories(anr_smoke_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/asi-mod/include"
+        "${PAWS_GENERATED_DIR}"
     )
     target_link_libraries(anr_smoke_test PRIVATE
         d3d11
         dxgi
+        d3dcompiler
         user32
     )
     if(MSVC)

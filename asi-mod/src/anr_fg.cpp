@@ -1,5 +1,7 @@
 #include "anr_fg.h"
+#include "optical_flow_shader.h"
 
+#include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -166,10 +168,15 @@ void AnrFrameGen::ReleaseResources() {
         d3d12ReadbackBuf_->Unmap(0, nullptr);
         readbackPtr_ = nullptr;
     }
+    ReleaseOpticalFlow();
+    SafeRelease(dx11SharedInSRV_);
     SafeRelease(dx11SharedIn_);
     SafeRelease(dx11SharedOut_);
+    SafeRelease(dx11SharedMVecsUAV_);
+    SafeRelease(dx11SharedMVecs_);
     SafeCloseHandle(sharedInHandle_);
     SafeCloseHandle(sharedOutHandle_);
+    SafeCloseHandle(sharedMVecsHandle_);
     SafeRelease(dx11StagingRead_);
     SafeRelease(dx11StagingWrite_);
     SafeRelease(d3d12UploadBuf_);
@@ -185,6 +192,148 @@ void AnrFrameGen::ReleaseResources() {
     width_ = 0;
     height_ = 0;
     frameCount_ = 0;
+}
+
+struct alignas(16) FlowCBData {
+    uint32_t fullSize[2];
+    uint32_t lowSize[2];
+};
+
+void AnrFrameGen::ReleaseOpticalFlow() {
+    SafeRelease(downsampleLumaCS_);
+    SafeRelease(computeFlowCS_);
+    SafeRelease(flowCB_);
+    for (int i = 0; i < 2; ++i) {
+        SafeRelease(lumaSRV_[i]);
+        SafeRelease(lumaUAV_[i]);
+        SafeRelease(lumaTex_[i]);
+    }
+    lowWidth_ = 0;
+    lowHeight_ = 0;
+    lumaIndex_ = 0;
+    opticalFlowReady_ = false;
+}
+
+bool AnrFrameGen::InitOpticalFlow(ID3D11Device* d3d11Dev, uint32_t width, uint32_t height) {
+    ReleaseOpticalFlow();
+    if (!d3d11Dev || !dx11SharedIn_ || !dx11SharedMVecs_) return false;
+
+    auto compileCS = [](const char* entry, ID3DBlob** outBlob) -> bool {
+        ID3DBlob* err = nullptr;
+        HRESULT hr = D3DCompile(kOpticalFlowHlsl, std::strlen(kOpticalFlowHlsl), nullptr, nullptr, nullptr,
+                                entry, "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, outBlob, &err);
+        if (FAILED(hr)) {
+            if (err) {
+                PAWS_LOG("OpticalFlow HLSL error (%s): %s", entry, static_cast<const char*>(err->GetBufferPointer()));
+                err->Release();
+            }
+            return false;
+        }
+        if (err) err->Release();
+        return true;
+    };
+
+    ID3DBlob* dsBlob = nullptr;
+    ID3DBlob* flBlob = nullptr;
+    if (!compileCS("DownsampleLuma", &dsBlob) || !compileCS("ComputeFlow", &flBlob)) {
+        SafeRelease(dsBlob);
+        SafeRelease(flBlob);
+        return false;
+    }
+
+    HRESULT hr1 = d3d11Dev->CreateComputeShader(dsBlob->GetBufferPointer(), dsBlob->GetBufferSize(), nullptr, &downsampleLumaCS_);
+    HRESULT hr2 = d3d11Dev->CreateComputeShader(flBlob->GetBufferPointer(), flBlob->GetBufferSize(), nullptr, &computeFlowCS_);
+    SafeRelease(dsBlob);
+    SafeRelease(flBlob);
+    if (FAILED(hr1) || FAILED(hr2)) {
+        ReleaseOpticalFlow();
+        return false;
+    }
+
+    D3D11_BUFFER_DESC cbd{};
+    cbd.Usage = D3D11_USAGE_DEFAULT;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.ByteWidth = sizeof(FlowCBData);
+    if (FAILED(d3d11Dev->CreateBuffer(&cbd, nullptr, &flowCB_))) {
+        ReleaseOpticalFlow();
+        return false;
+    }
+
+    if (FAILED(d3d11Dev->CreateShaderResourceView(dx11SharedIn_, nullptr, &dx11SharedInSRV_)) ||
+        FAILED(d3d11Dev->CreateUnorderedAccessView(dx11SharedMVecs_, nullptr, &dx11SharedMVecsUAV_))) {
+        ReleaseOpticalFlow();
+        return false;
+    }
+
+    lowWidth_ = std::max(width / 4u, 1u);
+    lowHeight_ = std::max(height / 4u, 1u);
+    D3D11_TEXTURE2D_DESC ltd{};
+    ltd.Width = lowWidth_;
+    ltd.Height = lowHeight_;
+    ltd.MipLevels = 1;
+    ltd.ArraySize = 1;
+    ltd.Format = DXGI_FORMAT_R16_FLOAT;
+    ltd.SampleDesc.Count = 1;
+    ltd.Usage = D3D11_USAGE_DEFAULT;
+    ltd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+
+    for (int i = 0; i < 2; ++i) {
+        if (FAILED(d3d11Dev->CreateTexture2D(&ltd, nullptr, &lumaTex_[i])) ||
+            FAILED(d3d11Dev->CreateShaderResourceView(lumaTex_[i], nullptr, &lumaSRV_[i])) ||
+            FAILED(d3d11Dev->CreateUnorderedAccessView(lumaTex_[i], nullptr, &lumaUAV_[i]))) {
+            ReleaseOpticalFlow();
+            return false;
+        }
+    }
+
+    lumaIndex_ = 0;
+    opticalFlowReady_ = true;
+    PAWS_LOG("ANR FG: GPU Optical Flow ready (%ux%u luma -> %ux%u R16G16_FLOAT motion vectors).",
+             lowWidth_, lowHeight_, width, height);
+    return true;
+}
+
+void AnrFrameGen::RunOpticalFlow(ID3D11DeviceContext* d3d11Ctx, bool hasPrevFrame) {
+    if (!opticalFlowReady_ || !d3d11Ctx) return;
+
+    FlowCBData cb{};
+    cb.fullSize[0] = width_;
+    cb.fullSize[1] = height_;
+    cb.lowSize[0] = lowWidth_;
+    cb.lowSize[1] = lowHeight_;
+    d3d11Ctx->UpdateSubresource(flowCB_, 0, nullptr, &cb, 0, 0);
+
+    uint32_t currIdx = lumaIndex_;
+    uint32_t prevIdx = 1u - lumaIndex_;
+    UINT gx = (lowWidth_ + 7) / 8;
+    UINT gy = (lowHeight_ + 7) / 8;
+
+    ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+    ID3D11UnorderedAccessView* nullUav[1] = { nullptr };
+
+    // Pass 1: Downsample current color -> 1/4-res luma
+    d3d11Ctx->CSSetShader(downsampleLumaCS_, nullptr, 0);
+    d3d11Ctx->CSSetConstantBuffers(0, 1, &flowCB_);
+    d3d11Ctx->CSSetShaderResources(0, 1, &dx11SharedInSRV_);
+    d3d11Ctx->CSSetUnorderedAccessViews(0, 1, &lumaUAV_[currIdx], nullptr);
+    d3d11Ctx->Dispatch(gx, gy, 1);
+    d3d11Ctx->CSSetShaderResources(0, 1, nullSrvs);
+    d3d11Ctx->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+
+    // Pass 2: Compute hierarchical optical flow -> shared R16G16_FLOAT motion vectors
+    if (hasPrevFrame) {
+        ID3D11ShaderResourceView* srvs[2] = { lumaSRV_[currIdx], lumaSRV_[prevIdx] };
+        d3d11Ctx->CSSetShader(computeFlowCS_, nullptr, 0);
+        d3d11Ctx->CSSetConstantBuffers(0, 1, &flowCB_);
+        d3d11Ctx->CSSetShaderResources(0, 2, srvs);
+        d3d11Ctx->CSSetUnorderedAccessViews(0, 1, &dx11SharedMVecsUAV_, nullptr);
+        d3d11Ctx->Dispatch(gx, gy, 1);
+        d3d11Ctx->CSSetShaderResources(0, 2, nullSrvs);
+        d3d11Ctx->CSSetUnorderedAccessViews(0, 1, nullUav, nullptr);
+    }
+
+    d3d11Ctx->CSSetShader(nullptr, nullptr, 0);
+    lumaIndex_ = prevIdx;
 }
 
 bool AnrFrameGen::CreateResources(ID3D11Device* d3d11Dev, uint32_t width, uint32_t height, DXGI_FORMAT fmt) {
@@ -233,15 +382,23 @@ bool AnrFrameGen::CreateResources(ID3D11Device* d3d11Dev, uint32_t width, uint32
                                        D3D12_HEAP_FLAG_NONE,
                                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                        &d3d12OutReal_);
+        bool okMVecs = okReal && makeTex(DXGI_FORMAT_R16G16_FLOAT,
+                                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS,
+                                         D3D12_HEAP_FLAG_SHARED,
+                                         D3D12_RESOURCE_STATE_COMMON,
+                                         &d3d12MVecs_);
 
-        if (okReal &&
+        if (okMVecs &&
             SUCCEEDED(d3d12Dev_->CreateSharedHandle(d3d12Backbuffer_, nullptr, GENERIC_ALL, nullptr, &sharedInHandle_)) &&
             SUCCEEDED(d3d12Dev_->CreateSharedHandle(d3d12OutInterp_, nullptr, GENERIC_ALL, nullptr, &sharedOutHandle_)) &&
+            SUCCEEDED(d3d12Dev_->CreateSharedHandle(d3d12MVecs_, nullptr, GENERIC_ALL, nullptr, &sharedMVecsHandle_)) &&
             SUCCEEDED(d3d11Dev1->OpenSharedResource1(sharedInHandle_, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dx11SharedIn_))) &&
-            SUCCEEDED(d3d11Dev1->OpenSharedResource1(sharedOutHandle_, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dx11SharedOut_)))) {
+            SUCCEEDED(d3d11Dev1->OpenSharedResource1(sharedOutHandle_, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dx11SharedOut_))) &&
+            SUCCEEDED(d3d11Dev1->OpenSharedResource1(sharedMVecsHandle_, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dx11SharedMVecs_)))) {
             useSharedHandles_ = true;
             PAWS_LOG("ANR FG: Using ZERO-COPY DX11<->D3D12 shared NT handle bridge (%ux%u, fmt=%d).",
                      width, height, static_cast<int>(d3d12Format_));
+            InitOpticalFlow(d3d11Dev, width, height);
         } else {
             ReleaseResources();
         }
@@ -322,12 +479,17 @@ bool AnrFrameGen::CreateResources(ID3D11Device* d3d11Dev, uint32_t width, uint32
                  width, height, static_cast<int>(d3d12Format_), swapRB_ ? 1 : 0);
     }
 
-    // 2.5 Create Depth (R32_FLOAT) and Motion Vectors (R16G16_FLOAT) textures required by ANR FG
+    // 2.5 Create Depth (R32_FLOAT) and fallback Motion Vectors (R16G16_FLOAT) textures required by ANR FG
     if (!makeTex(DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
-                 D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &d3d12Depth_) ||
+                 D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &d3d12Depth_)) {
+        PAWS_LOG("ANR FG: Failed to create D3D12 depth texture (%ux%u).", width, height);
+        ReleaseResources();
+        return false;
+    }
+    if (!d3d12MVecs_ &&
         !makeTex(DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE,
                  D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &d3d12MVecs_)) {
-        PAWS_LOG("ANR FG: Failed to create D3D12 depth/motion textures (%ux%u).", width, height);
+        PAWS_LOG("ANR FG: Failed to create D3D12 motion texture (%ux%u).", width, height);
         ReleaseResources();
         return false;
     }
@@ -382,13 +544,17 @@ bool AnrFrameGen::GenerateFrame(ID3D11DeviceContext* d3d11Ctx,
                                 ID3D11Texture2D* outInterpTex) {
     if (!ready_ || !fgHandle_) return false;
 
-    // 1. Copy DX11 realBackbuffer -> D3D12 d3d12Backbuffer_
+    const bool isReset = (frameCount_ == 0);
+
+    // 1. Copy DX11 realBackbuffer -> D3D12 d3d12Backbuffer_ & compute GPU optical flow motion vectors
     if (useSharedHandles_) {
         if (d3d11Ctx && realBackbuffer && dx11SharedIn_) {
             d3d11Ctx->CopyResource(dx11SharedIn_, realBackbuffer);
+            RunOpticalFlow(d3d11Ctx, !isReset);
             d3d11Ctx->Flush();
         }
         Transition(d3d12Backbuffer_, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Transition(d3d12MVecs_, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Transition(d3d12OutInterp_, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     } else {
         if (d3d11Ctx && realBackbuffer && dx11StagingRead_) {
@@ -419,7 +585,6 @@ bool AnrFrameGen::GenerateFrame(ID3D11DeviceContext* d3d11Ctx,
     }
 
     // 2. Evaluate ANR FG (1 interpolated frame between previous real frame and current real frame)
-    const bool isReset = (frameCount_ == 0);
     paramMap_.Set("Width", width_);
     paramMap_.Set("Height", height_);
     paramMap_.Set("DLSSG.Width", width_);
@@ -456,6 +621,7 @@ bool AnrFrameGen::GenerateFrame(ID3D11DeviceContext* d3d11Ctx,
     if (useSharedHandles_) {
         Transition(d3d12OutInterp_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
         Transition(d3d12Backbuffer_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Transition(d3d12MVecs_, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
         if (!SubmitAndWait()) return false;
         if (!isReset && d3d11Ctx && outInterpTex && dx11SharedOut_) {
             d3d11Ctx->CopyResource(outInterpTex, dx11SharedOut_);

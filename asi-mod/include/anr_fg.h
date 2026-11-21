@@ -185,8 +185,27 @@ private:
     // Shared-handle zero-copy bridge (preferred)
     HANDLE sharedInHandle_ = nullptr;
     HANDLE sharedOutHandle_ = nullptr;
+    HANDLE sharedMVecsHandle_ = nullptr;
     ID3D11Texture2D* dx11SharedIn_ = nullptr;
+    ID3D11ShaderResourceView* dx11SharedInSRV_ = nullptr;
     ID3D11Texture2D* dx11SharedOut_ = nullptr;
+    ID3D11Texture2D* dx11SharedMVecs_ = nullptr;
+    ID3D11UnorderedAccessView* dx11SharedMVecsUAV_ = nullptr;
+
+    // DX11 GPU Optical Flow compute shaders & 1/4-res luma pyramid
+    ID3D11ComputeShader* downsampleLumaCS_ = nullptr;
+    ID3D11ComputeShader* computeFlowCS_ = nullptr;
+    ID3D11Buffer* flowCB_ = nullptr;
+    ID3D11Texture2D* lumaTex_[2] = { nullptr, nullptr };
+    ID3D11ShaderResourceView* lumaSRV_[2] = { nullptr, nullptr };
+    ID3D11UnorderedAccessView* lumaUAV_[2] = { nullptr, nullptr };
+    uint32_t lowWidth_ = 0;
+    uint32_t lowHeight_ = 0;
+    uint32_t lumaIndex_ = 0;
+    bool opticalFlowReady_ = false;
+    bool InitOpticalFlow(ID3D11Device* d3d11Dev, uint32_t width, uint32_t height);
+    void ReleaseOpticalFlow();
+    void RunOpticalFlow(ID3D11DeviceContext* d3d11Ctx, bool hasPrevFrame);
 
     // Staging fallback bridge (works on all drivers if shared handles are unsupported)
     ID3D11Texture2D* dx11StagingRead_ = nullptr;
