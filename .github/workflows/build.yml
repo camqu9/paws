@@ -35,6 +35,7 @@ jobs:
           path: |
             build/bin/Release/paws.exe
             build/bin/Release/paws_gtav.asi
+            build/bin/Release/anr_smoke_test.exe
 
   build-linux:
     name: Linux (x64 GCC)

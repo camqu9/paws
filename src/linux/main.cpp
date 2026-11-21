@@ -627,22 +627,39 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
     fs::path srcAsi = ResolveAsiSourceLinux(customAsiPath);
     fs::path settingsPath = FindGtaVSettingsXmlLinux();
 
+    fs::path srcAnrDir = GetSelfDirectoryLinux() / "ANR_FG";
     std::cout << "[paws] Live GTA V watcher active (Linux / Proton / Wine).\n"
               << "[paws] Source ASI: " << srcAsi.string()
-              << (fs::exists(srcAsi) ? " (found)\n" : " (NOT found yet — place Windows-built paws_gtav.asi here or pass --asi <path>)\n");
+              << (fs::exists(srcAsi) ? " (found)\n" : " (NOT found yet — place Windows-built paws_gtav.asi here or pass --asi <path>)\n")
+              << "[paws] ANR FG dir: " << srcAnrDir.string()
+              << (fs::exists(srcAnrDir / "nvngx_dlssg.dll") ? " (found - ANR 2X AI Frame Gen ready!)\n" : " (not present - will use FSR RCAS)\n");
 
-    if (!settingsPath.empty()) {
-        std::cout << "[paws] Found GTA V settings.xml: " << settingsPath.string() << "\n";
-        ApplyGtaVSettingsLinux(settingsPath, samplingMode);
-    } else {
-        std::cout << "[paws] Note: GTA V settings.xml not found yet (is your SteamLibrary drive mounted?).\n";
+    if (samplingMode > 0) {
+        if (!settingsPath.empty()) {
+            std::cout << "[paws] Found GTA V settings.xml: " << settingsPath.string() << "\n";
+            ApplyGtaVSettingsLinux(settingsPath, samplingMode);
+        } else {
+            std::cout << "[paws] Note: GTA V settings.xml not found yet (is your SteamLibrary drive mounted?).\n";
+        }
     }
 
     std::cout << "[paws] Waiting for GTA V (PlayGTAV.exe / GTAVLauncher.exe / GTA5.exe) to start...\n"
-              << "[paws] Press Ctrl+C to stop watching (original settings.xml will be restored).\n";
+              << "[paws] Press Ctrl+C to stop watching.\n";
 
     bool active = false;
     fs::path deployedAsi;
+    fs::path deployedAnrDir;
+
+    auto removeAnrDir = [](const fs::path& dir) {
+        if (dir.empty()) return;
+        std::error_code ec;
+        if (fs::is_symlink(dir, ec) || fs::exists(dir, ec)) {
+            fs::remove_all(dir, ec);
+            if (!ec) {
+                std::cout << "[paws] Removed ANR_FG from GTA V folder: " << dir.string() << "\n";
+            }
+        }
+    };
 
     while (!g_ShouldQuit) {
         pid_t pid = 0;
@@ -652,11 +669,24 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
         if (running && !active) {
             std::cout << "\n[paws] Detected GTA V starting (PID " << pid << ") in: " << gameDir.string() << "\n";
 
-            if (settingsPath.empty()) {
-                settingsPath = FindGtaVSettingsXmlLinux();
+            if (samplingMode > 0) {
+                if (settingsPath.empty()) settingsPath = FindGtaVSettingsXmlLinux();
+                if (!settingsPath.empty() && !fs::exists(settingsPath.string() + ".paws.bak")) {
+                    ApplyGtaVSettingsLinux(settingsPath, samplingMode);
+                }
             }
-            if (!settingsPath.empty() && !fs::exists(settingsPath.string() + ".paws.bak")) {
-                ApplyGtaVSettingsLinux(settingsPath, samplingMode);
+
+            // Live-deploy ANR_FG directory (symlink for instant zero-copy deploy)
+            if (fs::exists(srcAnrDir / "nvngx_dlssg.dll")) {
+                fs::path dstAnr = gameDir / "ANR_FG";
+                std::error_code ec;
+                if (!fs::exists(dstAnr, ec) && !fs::is_symlink(dstAnr, ec)) {
+                    fs::create_directory_symlink(srcAnrDir, dstAnr, ec);
+                    if (!ec) {
+                        std::cout << "[paws] Live-deployed ANR_FG -> " << dstAnr.string() << "\n";
+                        deployedAnrDir = dstAnr;
+                    }
+                }
             }
 
             fs::path dstAsi = gameDir / "paws_gtav.asi";
@@ -684,13 +714,15 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
             } else {
                 std::cout << "[paws] Verified dinput8.dll in GTA V folder.\n";
             }
-            std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi & restore settings.xml when GTA V closes.\n";
+            std::cout << "[paws] Monitoring GTA V — will auto-remove paws_gtav.asi & ANR_FG when GTA V closes.\n";
             active = true;
         } else if (!running && active) {
             std::cout << "\n[paws] Detected GTA V closed.\n";
             RemoveAsiLinux(deployedAsi);
+            removeAnrDir(deployedAnrDir);
             RestoreGtaVSettingsLinux(settingsPath);
             deployedAsi.clear();
+            deployedAnrDir.clear();
             active = false;
             std::cout << "[paws] Resuming watch for GTA V...\n";
         }
@@ -698,11 +730,12 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    if (active && !deployedAsi.empty()) {
+    if (active) {
         pid_t pid = 0;
         fs::path dir;
         if (!FindRunningGtaVLinux(pid, dir)) {
             RemoveAsiLinux(deployedAsi);
+            removeAnrDir(deployedAnrDir);
         }
     }
     RestoreGtaVSettingsLinux(settingsPath);
@@ -711,14 +744,15 @@ int RunGtaVLiveWatcherLinux(const std::string& customAsiPath, int samplingMode) 
 }
 
 void PrintUsage() {
-    std::cout << "paws - Universal FSR 1.0 Spatial Upscaler & Live GTA V ASI Watcher (Linux)\n"
+    std::cout << "paws - Universal FSR 1.0 Spatial Upscaler & Live GTA V ANR FG Watcher (Linux)\n"
               << "Usage:\n"
-              << "  paws [--scale <1|2|3>]                        (live-watch GTA V: sets Frame Scaling, adds ASI, restores all on exit)\n"
-              << "  paws --watch-gtav [--scale <1|2|3>] [--asi <path/paws_gtav.asi>]\n"
+              << "  paws [--scale <0|1|2|3>]                      (live-watch GTA V: deploys ANR FG + ASI, removes all on exit)\n"
+              << "  paws --watch-gtav [--scale <0|1|2|3>] [--asi <path/paws_gtav.asi>]\n"
               << "  paws <path-to-executable-or-window-title> [--sharpness <0.0-2.0>]\n\n"
               << "Scale Presets (--scale):\n"
-              << "  1 = 1/2 (50% - Performance, highest FPS)\n"
-              << "  2 = 2/3 (67% - Quality, default)\n"
+              << "  0 = Native (keep your settings.xml, default for ANR 2X Frame Gen)\n"
+              << "  1 = 1/2 (50% - Performance)\n"
+              << "  2 = 2/3 (67% - Quality)\n"
               << "  3 = 3/4 (75% - Ultra Quality)\n\n"
               << "Hotkeys (FSR 1.0 Overlay):\n"
               << "  F8   Toggle RCAS sharpening on/off\n"
@@ -729,13 +763,13 @@ void PrintUsage() {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        return RunGtaVLiveWatcherLinux("", 3);
+        return RunGtaVLiveWatcherLinux("", 0);
     }
 
     std::string targetArg;
     std::string customAsiPath;
     float sharpness = 0.2f;
-    int samplingMode = 3; // Default: 2/3 (67% Quality)
+    int samplingMode = 0; // Default: keep native resolution for ANR 2X Frame Gen
     bool watchGtaV = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -748,7 +782,7 @@ int main(int argc, char** argv) {
         } else if (a == "--asi" && i + 1 < argc) {
             customAsiPath = argv[++i];
         } else if (a == "--scale" && i + 1 < argc) {
-            samplingMode = std::clamp(std::stoi(argv[++i]), 1, 4);
+            samplingMode = std::clamp(std::stoi(argv[++i]), 0, 4);
             watchGtaV = true;
         } else if (a == "--sharpness" && i + 1 < argc) {
             sharpness = std::stof(argv[++i]);

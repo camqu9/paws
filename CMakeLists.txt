@@ -66,6 +66,7 @@ if(WIN32)
         asi-mod/src/dx11_hook.cpp
         asi-mod/src/camera.cpp
         asi-mod/src/fsr_pipeline.cpp
+        asi-mod/src/anr_fg.cpp
     )
     set_target_properties(paws_gtav PROPERTIES
         PREFIX ""
@@ -83,6 +84,23 @@ if(WIN32)
     )
     if(MSVC)
         target_compile_options(paws_gtav PRIVATE /W4 /permissive- /utf-8)
+    endif()
+
+    # 4. Standalone ANR FG DX11<->D3D12 smoke test
+    add_executable(anr_smoke_test
+        asi-mod/src/anr_smoke_test.cpp
+        asi-mod/src/anr_fg.cpp
+    )
+    target_include_directories(anr_smoke_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/asi-mod/include"
+    )
+    target_link_libraries(anr_smoke_test PRIVATE
+        d3d11
+        dxgi
+        user32
+    )
+    if(MSVC)
+        target_compile_options(anr_smoke_test PRIVATE /W4 /permissive- /utf-8)
     endif()
 
     # Optional AMD FidelityFX FSR 2/3 SDK integration

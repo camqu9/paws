@@ -1,4 +1,5 @@
 #include "dx11_hook.h"
+#include "anr_fg.h"
 #include "camera.h"
 #include "fsr_pipeline.h"
 #include "paws_common.h"
@@ -38,6 +39,52 @@ ID3D11DeviceContext* g_Context = nullptr;
 
 FsrPipeline g_Pipeline;
 CameraTracker g_Camera;
+AnrFrameGen g_AnrFg;
+
+ID3D11Texture2D* g_RealFrameBackup = nullptr;
+ID3D11Texture2D* g_InterpFrameTex = nullptr;
+UINT g_FgBufW = 0;
+UINT g_FgBufH = 0;
+DXGI_FORMAT g_FgBufFmt = DXGI_FORMAT_UNKNOWN;
+
+void ReleaseFgBuffers() {
+    if (g_RealFrameBackup) {
+        g_RealFrameBackup->Release();
+        g_RealFrameBackup = nullptr;
+    }
+    if (g_InterpFrameTex) {
+        g_InterpFrameTex->Release();
+        g_InterpFrameTex = nullptr;
+    }
+    g_FgBufW = 0;
+    g_FgBufH = 0;
+    g_FgBufFmt = DXGI_FORMAT_UNKNOWN;
+}
+
+bool EnsureFgBuffers(ID3D11Device* dev, UINT w, UINT h, DXGI_FORMAT fmt) {
+    if (g_RealFrameBackup && g_InterpFrameTex && g_FgBufW == w && g_FgBufH == h && g_FgBufFmt == fmt) {
+        return true;
+    }
+    ReleaseFgBuffers();
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = w;
+    td.Height = h;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(dev->CreateTexture2D(&td, nullptr, &g_RealFrameBackup)) ||
+        FAILED(dev->CreateTexture2D(&td, nullptr, &g_InterpFrameTex))) {
+        ReleaseFgBuffers();
+        return false;
+    }
+    g_FgBufW = w;
+    g_FgBufH = h;
+    g_FgBufFmt = fmt;
+    return true;
+}
 
 // Tracked 3D scene buffers before 2D HUD draws
 ID3D11Texture2D* g_PendingColorTex = nullptr;
@@ -196,6 +243,8 @@ HRESULT STDMETHODCALLTYPE Hooked_ResizeBuffers(
     {
         std::lock_guard<std::mutex> lock(g_StateMutex);
         ReleasePendingBuffers();
+        ReleaseFgBuffers();
+        g_AnrFg.OnResize();
         g_Pipeline.OnResize();
         PAWS_LOG("ResizeBuffers: %ux%u (fmt=%d)", Width, Height, static_cast<int>(NewFormat));
     }
@@ -207,6 +256,9 @@ HRESULT STDMETHODCALLTYPE Hooked_ResizeBuffers(
 // Hooked IDXGISwapChain::Present
 // ============================================================================
 HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncInterval, UINT Flags) {
+    bool presentInterpolated = false;
+    ID3D11Texture2D* backbufferForPresent = nullptr;
+
     {
         std::lock_guard<std::mutex> lock(g_StateMutex);
         g_InInternalCall = true;
@@ -232,7 +284,7 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
         bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
         if (f9Down && !g_PrevF9) {
             g_FsrEnabled = !g_FsrEnabled;
-            PAWS_LOG("Hotkey F9 -> FSR 2/3: %s", g_FsrEnabled ? "ENABLED" : "DISABLED");
+            PAWS_LOG("Hotkey F9 -> ANR FG / FSR: %s", g_FsrEnabled ? "ENABLED" : "DISABLED");
         }
         g_PrevF9 = f9Down;
 
@@ -256,8 +308,25 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
             }
             ReleasePendingBuffers();
 
-            // Run Motion Vector CS -> FSR 2/3 -> Debug Overlay
-            g_Pipeline.Execute(g_Context, backbuffer, g_Camera, g_FsrEnabled, g_DebugMode);
+            bool anrHandled = false;
+            if (g_FsrEnabled && g_DebugMode == DebugViewMode::Normal && !g_AnrFg.HasFailedPermanently()) {
+                if (g_AnrFg.EnsureReady(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format) &&
+                    EnsureFgBuffers(g_Device, bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
+                    g_Context->CopyResource(g_RealFrameBackup, backbuffer);
+                    if (g_AnrFg.GenerateFrame(g_Context, g_RealFrameBackup, g_InterpFrameTex)) {
+                        g_Context->CopyResource(backbuffer, g_InterpFrameTex);
+                        backbuffer->AddRef();
+                        backbufferForPresent = backbuffer;
+                        presentInterpolated = true;
+                    }
+                    anrHandled = true;
+                }
+            }
+
+            if (!anrHandled) {
+                // Fallback to native DX11 FSR RCAS + debug views
+                g_Pipeline.Execute(g_Context, backbuffer, g_Camera, g_FsrEnabled, g_DebugMode);
+            }
             g_Pipeline.ResetFrameCaptureFlag();
 
             backbuffer->Release();
@@ -268,12 +337,11 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
         double logDt = std::chrono::duration<double>(now - g_FpsLogTimer).count();
         if (logDt >= 5.0) {
             double fps = static_cast<double>(g_FpsFrameCount) / logDt;
-            PAWS_LOG("Status | FPS: %.1f | FSR: %s | DebugView: %s | Jitter: (%.3f, %.3f)",
+            PAWS_LOG("Status | Real FPS: %.1f | Mode: %s | Enabled: %s | DebugView: %s",
                      fps,
+                     g_AnrFg.IsReady() ? "ANR FG 2X" : "FSR RCAS",
                      g_FsrEnabled ? "ON" : "OFF",
-                     DebugViewName(g_DebugMode),
-                     g_Camera.GetJitterPixelsX(),
-                     g_Camera.GetJitterPixelsY());
+                     DebugViewName(g_DebugMode));
             g_FpsFrameCount = 0;
             g_FpsLogTimer = now;
         }
@@ -281,10 +349,26 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
         g_InInternalCall = false;
     }
 
+    // Present AI-generated interpolated frame first, then restore real frame and present it!
+    if (presentInterpolated && backbufferForPresent) {
+        g_OrigPresent(pSwapChain, 0, Flags);
+        {
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            if (g_Context && g_RealFrameBackup) {
+                g_Context->CopyResource(backbufferForPresent, g_RealFrameBackup);
+            }
+        }
+        backbufferForPresent->Release();
+    }
+
     return g_OrigPresent(pSwapChain, SyncInterval, Flags);
 }
 
 } // namespace
+
+void Dx11Hook::SetModuleDirectory(const std::wstring& dir) {
+    g_AnrFg.SetModuleDirectory(dir);
+}
 
 bool Dx11Hook::Install() {
     std::lock_guard<std::mutex> lock(g_StateMutex);
@@ -381,6 +465,8 @@ void Dx11Hook::Uninstall() {
     }
 
     ReleasePendingBuffers();
+    ReleaseFgBuffers();
+    g_AnrFg.Shutdown();
     g_Pipeline.Shutdown();
     if (g_Context) {
         g_Context->Release();

@@ -11,11 +11,13 @@ DWORD WINAPI InitThread(LPVOID moduleHandle) {
     // Place paws_gtav.log next to paws_gtav.asi (inside GTA V directory)
     wchar_t modPath[MAX_PATH] = {};
     GetModuleFileNameW(hMod, modPath, MAX_PATH);
-    std::filesystem::path logPath = std::filesystem::path(modPath).parent_path() / L"paws_gtav.log";
+    std::filesystem::path modDir = std::filesystem::path(modPath).parent_path();
+    std::filesystem::path logPath = modDir / L"paws_gtav.log";
 
     paws::Logger::Instance().Init(logPath.c_str());
-    PAWS_LOG("paws_gtav.asi loaded (Story Mode FSR 2/3 plugin).");
-    PAWS_LOG("Hotkeys: F8 = Cycle Normal / Depth Buffer / Motion Vectors | F9 = Toggle FSR.");
+    paws::Dx11Hook::SetModuleDirectory(modDir.wstring());
+    PAWS_LOG("paws_gtav.asi loaded (Story Mode ANR FG + FSR plugin).");
+    PAWS_LOG("Hotkeys: F8 = Cycle Normal / Depth Buffer / Motion Vectors | F9 = Toggle ANR FG.");
 
     // Wait briefly until d3d11.dll is loaded by GTA5.exe
     for (int i = 0; i < 100 && GetModuleHandleW(L"d3d11.dll") == nullptr; ++i) {
