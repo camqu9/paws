@@ -104,8 +104,10 @@ auto g_LastFrameTime = std::chrono::steady_clock::now();
 auto g_FirstPresentTime = std::chrono::steady_clock::time_point{};
 bool g_HasFirstPresent = false;
 bool g_LoggedAnrDelay = false;
+float g_AvgRealFrameMs = 20.0f;
 auto g_FpsLogTimer = std::chrono::steady_clock::now();
 int g_FpsFrameCount = 0;
+int g_PresentedFrameCount = 0;
 
 bool PatchVTableEntry(void** vtable, size_t index, void* hookFn, void** outOrigFn) {
     if (!vtable) return false;
@@ -300,6 +302,9 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
         double secsSinceStart = std::chrono::duration<double>(now - g_FirstPresentTime).count();
         float dtMs = std::chrono::duration<float, std::milli>(now - g_LastFrameTime).count();
         g_LastFrameTime = now;
+        if (dtMs > 2.0f && dtMs < 100.0f) {
+            g_AvgRealFrameMs = g_AvgRealFrameMs * 0.9f + dtMs * 0.1f;
+        }
 
         ID3D11Texture2D* backbuffer = nullptr;
         if (g_Device && g_Context &&
@@ -331,8 +336,6 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
                     g_Context->CopyResource(g_RealFrameBackup, backbuffer);
                     if (g_AnrFg.GenerateFrame(g_Context, g_RealFrameBackup, g_InterpFrameTex)) {
                         g_Context->CopyResource(backbuffer, g_InterpFrameTex);
-                        backbuffer->AddRef();
-                        backbufferForPresent = backbuffer;
                         presentInterpolated = true;
                     }
                     anrHandled = true;
@@ -350,33 +353,52 @@ HRESULT STDMETHODCALLTYPE Hooked_Present(IDXGISwapChain* pSwapChain, UINT SyncIn
 
         // Periodic FPS logging to paws_gtav.log (every 5 seconds)
         ++g_FpsFrameCount;
+        g_PresentedFrameCount += (presentInterpolated ? 2 : 1);
         double logDt = std::chrono::duration<double>(now - g_FpsLogTimer).count();
         if (logDt >= 5.0) {
-            double fps = static_cast<double>(g_FpsFrameCount) / logDt;
-            PAWS_LOG("Status | Real FPS: %.1f | Mode: %s | Enabled: %s | DebugView: %s",
-                     fps,
+            double realFps = static_cast<double>(g_FpsFrameCount) / logDt;
+            double outFps = static_cast<double>(g_PresentedFrameCount) / logDt;
+            PAWS_LOG("Status | Real FPS: %.1f | Output FPS: %.1f | Mode: %s | Enabled: %s | DebugView: %s",
+                     realFps,
+                     outFps,
                      g_AnrFg.IsReady() ? "ANR FG 2X" : "FSR RCAS",
                      g_FsrEnabled ? "ON" : "OFF",
                      DebugViewName(g_DebugMode));
             g_FpsFrameCount = 0;
+            g_PresentedFrameCount = 0;
             g_FpsLogTimer = now;
         }
 
         g_InInternalCall = false;
     }
 
-    // Present AI-generated interpolated frame first, then restore real frame and present it!
-    if (presentInterpolated && backbufferForPresent) {
-        g_OrigPresent(pSwapChain, 0, Flags);
-        {
-            std::lock_guard<std::mutex> lock(g_StateMutex);
-            if (g_Context && g_RealFrameBackup) {
-                g_Context->CopyResource(backbufferForPresent, g_RealFrameBackup);
+    // Present AI-generated interpolated frame first with proper pacing so the monitor scans it out,
+    // then copy the real frame into the fresh backbuffer and present it!
+    if (presentInterpolated) {
+        UINT interpSync = (SyncInterval > 0) ? 1u : 0u;
+        g_OrigPresent(pSwapChain, interpSync, Flags);
+
+        if (SyncInterval == 0) {
+            float halfMs = g_AvgRealFrameMs * 0.45f;
+            if (halfMs >= 1.0f && halfMs <= 20.0f) {
+                Sleep(static_cast<DWORD>(halfMs));
             }
         }
-        backbufferForPresent->Release();
+
+        ID3D11Texture2D* nextBackbuffer = nullptr;
+        if (SUCCEEDED(pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&nextBackbuffer))) &&
+            nextBackbuffer) {
+            {
+                std::lock_guard<std::mutex> lock(g_StateMutex);
+                if (g_Context && g_RealFrameBackup) {
+                    g_Context->CopyResource(nextBackbuffer, g_RealFrameBackup);
+                }
+            }
+            nextBackbuffer->Release();
+        }
     }
 
+    (void)backbufferForPresent;
     return g_OrigPresent(pSwapChain, SyncInterval, Flags);
 }
 
