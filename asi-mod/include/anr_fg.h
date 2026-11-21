@@ -177,6 +177,8 @@ private:
 
     // D3D12 textures for ANR FG
     ID3D12Resource* d3d12Backbuffer_ = nullptr;
+    ID3D12Resource* d3d12Depth_ = nullptr;
+    ID3D12Resource* d3d12MVecs_ = nullptr;
     ID3D12Resource* d3d12OutInterp_ = nullptr;
     ID3D12Resource* d3d12OutReal_ = nullptr;
 

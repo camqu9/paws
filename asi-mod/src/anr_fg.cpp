@@ -175,6 +175,8 @@ void AnrFrameGen::ReleaseResources() {
     SafeRelease(d3d12UploadBuf_);
     SafeRelease(d3d12ReadbackBuf_);
     SafeRelease(d3d12Backbuffer_);
+    SafeRelease(d3d12Depth_);
+    SafeRelease(d3d12MVecs_);
     SafeRelease(d3d12OutInterp_);
     SafeRelease(d3d12OutReal_);
 
@@ -320,6 +322,16 @@ bool AnrFrameGen::CreateResources(ID3D11Device* d3d11Dev, uint32_t width, uint32
                  width, height, static_cast<int>(d3d12Format_), swapRB_ ? 1 : 0);
     }
 
+    // 2.5 Create Depth (R32_FLOAT) and Motion Vectors (R16G16_FLOAT) textures required by ANR FG
+    if (!makeTex(DXGI_FORMAT_R32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+                 D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &d3d12Depth_) ||
+        !makeTex(DXGI_FORMAT_R16G16_FLOAT, D3D12_RESOURCE_FLAG_NONE,
+                 D3D12_HEAP_FLAG_NONE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &d3d12MVecs_)) {
+        PAWS_LOG("ANR FG: Failed to create D3D12 depth/motion textures (%ux%u).", width, height);
+        ReleaseResources();
+        return false;
+    }
+
     // 3. Create ANR FG feature on D3D12 command list
     paramMap_.Set("CreationNodeMask", 1u);
     paramMap_.Set("VisibilityNodeMask", 1u);
@@ -420,8 +432,15 @@ bool AnrFrameGen::GenerateFrame(ID3D11DeviceContext* d3d11Ctx,
     paramMap_.Set("DLSSG.HUDLess", static_cast<ID3D12Resource*>(nullptr));
     paramMap_.Set("DLSSG.UI", static_cast<ID3D12Resource*>(nullptr));
     paramMap_.Set("DLSSG.UIAlpha", static_cast<ID3D12Resource*>(nullptr));
-    paramMap_.Set("DLSSG.Depth", static_cast<ID3D12Resource*>(nullptr));
-    paramMap_.Set("DLSSG.MVecs", static_cast<ID3D12Resource*>(nullptr));
+    paramMap_.Set("DLSSG.Depth", d3d12Depth_);
+    paramMap_.Set("DLSSG.MVecs", d3d12MVecs_);
+    paramMap_.Set("DLSSG.DepthInverted", 1u);
+    paramMap_.Set("DLSSG.MvecScaleX", 1.0f);
+    paramMap_.Set("DLSSG.MvecScaleY", 1.0f);
+    paramMap_.Set("DLSSG.CameraNear", 0.15f);
+    paramMap_.Set("DLSSG.CameraFar", 10000.0f);
+    paramMap_.Set("DLSSG.CameraFOV", 1.0f);
+    paramMap_.Set("DLSSG.CameraAspectRatio", static_cast<float>(width_) / static_cast<float>(height_));
     paramMap_.Set("DLSSG.OutputInterpolated", d3d12OutInterp_);
     paramMap_.Set("DLSSG.OutputReal", d3d12OutReal_);
 
