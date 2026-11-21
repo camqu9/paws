@@ -221,7 +221,7 @@ bool AnrFrameGen::InitOpticalFlow(ID3D11Device* d3d11Dev, uint32_t width, uint32
     auto compileCS = [](const char* entry, ID3DBlob** outBlob) -> bool {
         ID3DBlob* err = nullptr;
         HRESULT hr = D3DCompile(kOpticalFlowHlsl, std::strlen(kOpticalFlowHlsl), nullptr, nullptr, nullptr,
-                                entry, "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, outBlob, &err);
+                                entry, "cs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, outBlob, &err);
         if (FAILED(hr)) {
             if (err) {
                 PAWS_LOG("OpticalFlow HLSL error (%s): %s", entry, static_cast<const char*>(err->GetBufferPointer()));

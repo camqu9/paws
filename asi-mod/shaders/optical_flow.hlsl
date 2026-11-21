@@ -65,9 +65,9 @@ void ComputeFlow(uint3 DTid : SV_DispatchThreadID) {
 
     if (zeroSad > 0.015) {
         // Step 1: Coarse search (step = 4 low-res = 16 full-res px, +/-12 low-res = +/-48 px)
-        [unroll]
+        [loop]
         for (int oy = -12; oy <= 12; oy += 4) {
-            [unroll]
+            [loop]
             for (int ox = -12; ox <= 12; ox += 4) {
                 if (ox == 0 && oy == 0) continue;
                 float s = PatchSAD(currP, currP + int2(ox, oy), maxCoord) + 0.002;
@@ -80,9 +80,9 @@ void ComputeFlow(uint3 DTid : SV_DispatchThreadID) {
 
         // Step 2: Medium refinement (step = 2 low-res = 8 full-res px)
         int2 center2 = bestOff;
-        [unroll]
+        [loop]
         for (int oy = -2; oy <= 2; oy += 2) {
-            [unroll]
+            [loop]
             for (int ox = -2; ox <= 2; ox += 2) {
                 if (ox == 0 && oy == 0) continue;
                 int2 cand = center2 + int2(ox, oy);
@@ -96,9 +96,9 @@ void ComputeFlow(uint3 DTid : SV_DispatchThreadID) {
 
         // Step 3: Fine refinement (step = 1 low-res = 4 full-res px)
         int2 center3 = bestOff;
-        [unroll]
+        [loop]
         for (int oy = -1; oy <= 1; ++oy) {
-            [unroll]
+            [loop]
             for (int ox = -1; ox <= 1; ++ox) {
                 if (ox == 0 && oy == 0) continue;
                 int2 cand = center3 + int2(ox, oy);
